@@ -29,7 +29,9 @@ export function OfflineUsernameStep() {
     try {
       await flow.createOfflineAccount(username())
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to create offline account")
+      setError(
+        e instanceof Error ? e.message : "Failed to create offline account"
+      )
       setLoading(false)
     }
   }
@@ -93,8 +95,7 @@ export function OfflineUsernameStep() {
               <li
                 classList={{
                   "text-green-400":
-                    username().length > 0 &&
-                    /^[a-zA-Z0-9_]*$/.test(username())
+                    username().length > 0 && /^[a-zA-Z0-9_]*$/.test(username())
                 }}
               >
                 <Trans key="auth:_trn_offline.requirement_characters" />
