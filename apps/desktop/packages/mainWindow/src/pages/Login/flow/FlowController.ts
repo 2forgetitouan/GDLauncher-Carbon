@@ -361,6 +361,22 @@ export class FlowControllerImpl implements FlowController {
     this.data.termsAndPrivacyAccepted = true
   }
 
+  async createOfflineAccount(username: string): Promise<void> {
+    try {
+      await this.rspcContext.client.mutation([
+        "account.enroll.offline",
+        username
+      ])
+      // Skip GDL account setup for offline accounts
+      await this.saveGdlAccountMutation.mutateAsync("")
+      this.data.activeUuid = username
+      await this.exitFlow("library")
+    } catch (error) {
+      console.error("[FlowController] Failed to create offline account:", error)
+      throw error
+    }
+  }
+
   async startEnrollment(method: "browser" | "device-code"): Promise<void> {
     try {
       if (method === "device-code") {

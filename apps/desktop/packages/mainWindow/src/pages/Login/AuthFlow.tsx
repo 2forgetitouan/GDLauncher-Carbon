@@ -30,6 +30,7 @@ import { WelcomeStep } from "./steps/WelcomeStep"
 import { TermsStep } from "./steps/TermsStep"
 import { AuthMethodStep } from "./steps/AuthMethodStep"
 import { EnrollingStep } from "./steps/EnrollingStep"
+import { OfflineUsernameStep } from "./steps/OfflineUsernameStep"
 import { ProfileCreationStep } from "./steps/ProfileCreationStep"
 import { GdlAccountStep } from "./steps/GdlAccountStep"
 import { GdlAccountFormStep } from "./steps/GdlAccountFormStep"
@@ -580,6 +581,7 @@ function AuthFlowContent() {
             return step.variant !== "forced"
           case "auth-method":
           case "enrolling":
+          case "offline-username":
           case "profile-creation":
           case "gdl-account-form":
             return true
@@ -689,6 +691,8 @@ function AuthFlowContent() {
         )
       case "auth-method":
         return <Trans key="auth:_trn_login.titles.sign_in_with_microsoft" />
+      case "offline-username":
+        return <Trans key="auth:_trn_offline.title" />
       case "enrolling":
         return step.method === "browser" ? (
           <Trans key="auth:_trn_login.titles.browser_authentication" />
@@ -805,6 +809,10 @@ function AuthFlowContent() {
                   {(step) => <EnrollingStep step={step()} />}
                 </Match>
 
+                <Match when={getCurrentStep()?.type === "offline-username"}>
+                  <OfflineUsernameStep />
+                </Match>
+
                 <Match when={getStepAs("profile-creation")}>
                   {(step) => (
                     <ProfileCreationStep
@@ -891,6 +899,12 @@ function AuthFlowContent() {
                       }
                       break
                     case "enrolling":
+                      flow.goToStep(
+                        { type: "auth-method" },
+                        { direction: "backward" }
+                      )
+                      break
+                    case "offline-username":
                       flow.goToStep(
                         { type: "auth-method" },
                         { direction: "backward" }

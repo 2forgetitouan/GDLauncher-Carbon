@@ -1533,6 +1533,37 @@ impl<'s> ManagerRef<'s, AccountManager> {
         }
     }
 
+    pub async fn create_offline_account(self, username: String) -> anyhow::Result<()> {
+        let username = username.trim().to_string();
+
+        if username.len() < 3 || username.len() > 16 {
+            bail!("Username must be between 3 and 16 characters");
+        }
+
+        if !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            bail!("Username can only contain letters, numbers, and underscores");
+        }
+
+        let uuid = generate_offline_uuid(&username);
+
+        info!("Creating offline account '{}' with UUID {}", username, uuid);
+
+        let account = FullAccount {
+            username,
+            uuid: uuid.clone(),
+            type_: FullAccountType::Offline,
+            last_used: Utc::now().into(),
+        };
+
+        self.add_account(account).await?;
+        self.set_active_uuid(Some(uuid)).await?;
+
+        Ok(())
+    }
+
     pub async fn begin_enrollment(self) -> anyhow::Result<()> {
         let mut enrollment_lock = self.active_enrollment.write().await;
 
@@ -2350,6 +2381,31 @@ pub enum FullAccountLoadError {
         "attempted to parse microsoft account DB entry(uuid {0}), but was missing refresh token expiration timestamp"
     )]
     MissingExpiration(String),
+}
+
+/// Generate a stable offline UUID matching the Minecraft server algorithm.
+/// Uses MD5 of "OfflinePlayer:<username>" with UUID version 3 bits.
+fn generate_offline_uuid(username: &str) -> String {
+    use md5::{Digest, Md5};
+
+    let mut hasher = Md5::new();
+    hasher.update(format!("OfflinePlayer:{}", username).as_bytes());
+    let result = hasher.finalize();
+    let mut bytes: [u8; 16] = result.into();
+
+    // Set version to 3 (name-based MD5)
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    // Set variant to RFC 4122
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
 }
 
 #[cfg(test)]

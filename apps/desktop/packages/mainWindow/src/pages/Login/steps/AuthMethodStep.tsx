@@ -98,6 +98,25 @@ export function AuthMethodStep() {
               <Trans key="auth:_trn_login.use_device_code_instead" />
             </button>
           </div>
+
+          {/* Alternative: Offline */}
+          <div class="border-darkSlate-600 flex flex-col gap-2 border-t pt-3">
+            <p class="text-lightSlate-600 m-0 text-xs">
+              <Trans key="auth:_trn_offline.no_microsoft_account" />
+            </p>
+            <button
+              type="button"
+              class="text-lightSlate-400 hover:text-lightSlate-200 cursor-pointer text-sm font-medium underline disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                flow.goToStep({ type: "offline-username" })
+              }}
+              disabled={loading()}
+            >
+              <Trans key="auth:_trn_offline.play_offline" />
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -66,6 +66,10 @@ pub(super) fn mount() -> RouterBuilder<App> {
             }
         }
 
+        mutation ENROLL_OFFLINE[app, username: String] {
+            app.account_manager().create_offline_account(username).await
+        }
+
         mutation ENROLL_FINALIZE[app, args: ()] {
             app.account_manager().finalize_enrollment().await
         }

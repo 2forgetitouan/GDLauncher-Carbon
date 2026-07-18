@@ -41,6 +41,7 @@ keys! {
         DELETE_ACCOUNT                              = "deleteAccount";
         ENROLL_BEGIN                                = "enroll.begin";
         ENROLL_BEGIN_BROWSER                        = "enroll.beginBrowser";
+        ENROLL_OFFLINE                              = "enroll.offline";
         ENROLL_PROTOCOL_CALLBACK                    = "enroll.protocolCallback";
         ENROLL_CANCEL                               = "enroll.cancel";
         ENROLL_GET_STATUS                           = "enroll.getStatus";

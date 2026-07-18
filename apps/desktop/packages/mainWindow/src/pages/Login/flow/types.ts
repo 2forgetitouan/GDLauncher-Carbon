@@ -77,6 +77,7 @@ export type AuthStep =
       type: "enrolling"
       method: "browser" | "device-code"
     }
+  | { type: "offline-username" }
   | { type: "profile-creation"; accessToken: string }
   | { type: "gdl-account"; gdlAccount: GDLAccountState }
   | { type: "gdl-account-form"; email?: string; displayName?: string }
@@ -213,6 +214,7 @@ export interface FlowController {
 
   // Data operations (may show global loading)
   acceptTerms(): Promise<void>
+  createOfflineAccount(username: string): Promise<void>
   startEnrollment(method: "browser" | "device-code"): Promise<void>
   cancelEnrollment(): Promise<void>
   checkUsernameAvailability(
