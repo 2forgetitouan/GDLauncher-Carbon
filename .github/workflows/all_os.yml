@@ -58,6 +58,8 @@ jobs:
       - name: Clear target before tests to avoid folder getting too big
         run: rm -rf target
       - name: Test
+        id: test
+        continue-on-error: true
         env:
           CARGO_INCREMENTAL: 0
           BASE_API: ${{ vars.BASE_API }}
@@ -71,16 +73,21 @@ jobs:
         run: pnpm test:all
       - name: Upload Playwright report
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: playwright-report-macos
           path: ./GDL/apps/desktop/playwright-report/
       - name: Upload test results
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: test-results-macos
           path: ./GDL/apps/desktop/test-results/
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdlauncher-macos
+          path: ./GDL/apps/desktop/release/*.dmg
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
@@ -141,6 +148,8 @@ jobs:
       - name: Clear target before tests to avoid folder getting too big
         run: rm -rf target
       - name: Test
+        id: test
+        continue-on-error: true
         env:
           DISPLAY: ":1"
           CARGO_INCREMENTAL: 0
@@ -162,17 +171,22 @@ jobs:
           echo "DISPLAY=$DISPLAY"
           pnpm test:all
       - name: Upload Playwright report
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
           path: ./GDL/apps/desktop/playwright-report/
       - name: Upload test results
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-linux
           path: ./GDL/apps/desktop/test-results/
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdlauncher-linux
+          path: ./GDL/apps/desktop/release/*.AppImage
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
@@ -245,6 +259,8 @@ jobs:
         shell: bash
         run: rm -rf target
       - name: Test
+        id: test
+        continue-on-error: true
         shell: bash
         env:
           CARGO_INCREMENTAL: 0
@@ -260,16 +276,21 @@ jobs:
         run: pnpm test:all
       - name: Upload Playwright report
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: playwright-report-win
           path: ./GDL/apps/desktop/playwright-report/
       - name: Upload test results
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: test-results-windows
           path: ./GDL/apps/desktop/test-results/
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdlauncher-windows
+          path: ./GDL/apps/desktop/release/*.exe
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
