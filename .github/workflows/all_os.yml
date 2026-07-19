@@ -41,7 +41,7 @@ jobs:
           CARGO_INCREMENTAL: 0
         run: pnpm prisma:generate
       - name: Build
-        run: pnpm build:mac-universal
+        run: pnpm build:mac-universal-prod
         env:
           CARGO_INCREMENTAL: 0
           BASE_API: ${{ vars.BASE_API }}
@@ -129,9 +129,9 @@ jobs:
       - name: Prisma codegen
         env:
           CARGO_INCREMENTAL: 0
-        run: pnpm prisma:generate:linux-x64
+        run: pnpm prisma:generate:linux-x64-prod
       - name: Build
-        run: pnpm build:linux-x64
+        run: pnpm build:linux-x64-prod
         env:
           CARGO_INCREMENTAL: 0
           BASE_API: ${{ vars.BASE_API }}
@@ -236,10 +236,10 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
-        run: pnpm prisma:generate:win-x64
+        run: pnpm prisma:generate:win-x64-prod
       - name: Build
         shell: bash
-        run: pnpm build:win-x64
+        run: pnpm build:win-x64-prod
         env:
           CARGO_INCREMENTAL: 0
           BASE_API: ${{ vars.BASE_API }}
