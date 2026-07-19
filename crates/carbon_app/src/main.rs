@@ -65,7 +65,7 @@ pub fn main() {
     #[cfg(not(test))]
     let _guard = {
         let s = sentry::init((
-            env!("CORE_MODULE_DSN"),
+            option_env!("CORE_MODULE_DSN").unwrap_or(""),
             sentry::ClientOptions {
                 release: Some(app_version::APP_VERSION.into()),
                 ..Default::default()
