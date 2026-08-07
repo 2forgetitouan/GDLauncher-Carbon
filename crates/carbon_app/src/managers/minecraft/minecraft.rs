@@ -1072,6 +1072,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires network access to api-snapshot.gdlauncher.com"]
     async fn test_extract_natives() {
         let app = crate::setup_managers_for_test().await;
 
