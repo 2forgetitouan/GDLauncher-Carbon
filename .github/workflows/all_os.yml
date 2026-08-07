@@ -16,17 +16,27 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           path: GDL
-      - uses: actions/setup-node@v3
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "24.14.0"
+          cache: "pnpm"
+          cache-dependency-path: "GDL/pnpm-lock.yaml"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
           targets: aarch64-apple-darwin, x86_64-apple-darwin
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+          cache-on-failure: true
       - name: Prepare
         run: |
           echo "" > crates/carbon_repos/src/db.rs
@@ -52,8 +62,8 @@ jobs:
         id: lint
         continue-on-error: true
         run: pnpm lint
-      - name: Clear target before tests to avoid folder getting too big
-        run: rm -rf target
+      - name: Clear release artifacts to free disk before tests
+        run: rm -rf target/release
       - name: Test
         id: test
         continue-on-error: true
@@ -104,17 +114,29 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 80
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           path: GDL
-      - uses: actions/setup-node@v3
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "24.14.0"
+          cache: "pnpm"
+          cache-dependency-path: "GDL/pnpm-lock.yaml"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
           targets: x86_64-unknown-linux-gnu
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+          cache-on-failure: true
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
       - name: Prepare
         run: |
           echo "" > crates/carbon_repos/src/db.rs
@@ -128,6 +150,7 @@ jobs:
         run: pnpm build:linux-x64-prod
         env:
           CARGO_INCREMENTAL: 0
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           BASE_API: ${{ vars.BASE_API }}
           TEST_BASE_API: ${{ vars.TEST_BASE_API }}
           MS_AUTH_CLIENT_ID: ${{ vars.MS_AUTH_CLIENT_ID }}
@@ -140,8 +163,8 @@ jobs:
         id: lint
         continue-on-error: true
         run: pnpm lint
-      - name: Clear target before tests to avoid folder getting too big
-        run: rm -rf target
+      - name: Clear release artifacts to free disk before tests
+        run: rm -rf target/release
       - name: Test
         id: test
         continue-on-error: true
@@ -201,17 +224,27 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 80
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           path: GDL
-      - uses: actions/setup-node@v3
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "24.14.0"
+          cache: "pnpm"
+          cache-dependency-path: "GDL/pnpm-lock.yaml"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
           targets: x86_64-pc-windows-msvc
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+          cache-on-failure: true
       - name: Install scoop and llvm
         run: |
           Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://get.scoop.sh')
@@ -246,9 +279,9 @@ jobs:
         continue-on-error: true
         shell: bash
         run: pnpm lint
-      - name: Clear target before tests to avoid folder getting too big
+      - name: Clear release artifacts to free disk before tests
         shell: bash
-        run: rm -rf target
+        run: rm -rf target/release
       - name: Test
         id: test
         continue-on-error: true
