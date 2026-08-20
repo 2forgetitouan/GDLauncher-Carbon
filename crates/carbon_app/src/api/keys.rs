@@ -100,7 +100,9 @@ keys! {
         GET_ALL_INSTANCES                           = "getAllInstances";
         CREATE_INSTANCE                             = "createInstance";
         CHANGE_MODPACK                              = "changeModpack";
-        REINSTALL_MODPACK                           = "reinstallModpack";
+        REPAIR_MODPACK                              = "repairModpack";
+        GET_REPAIR_PREVIEW                          = "getRepairPreview";
+        CHECK_PACK_ORIGIN                           = "checkPackOrigin";
         LOAD_ICON_URL                               = "loadIconUrl";
         DELETE_GROUP                                = "deleteGroup";
         DELETE_GROUP_WITH_INSTANCES                 = "deleteGroupWithInstances";
@@ -188,6 +190,9 @@ keys! {
         // Memory warning dismissal
         GET_MEMORY_WARNING_DISMISSED                = "getMemoryWarningDismissed";
         SET_MEMORY_WARNING_DISMISSED                = "setMemoryWarningDismissed";
+        // World deletion confirmation dismissal
+        GET_WORLD_DELETION_WARNING_DISMISSED        = "getWorldDeletionWarningDismissed";
+        SET_WORLD_DELETION_WARNING_DISMISSED        = "setWorldDeletionWarningDismissed";
         // Cache cleanup
         GET_DB_SIZE                                 = "getDbSize";
         GET_CACHE_SIZES                             = "getCacheSizes";

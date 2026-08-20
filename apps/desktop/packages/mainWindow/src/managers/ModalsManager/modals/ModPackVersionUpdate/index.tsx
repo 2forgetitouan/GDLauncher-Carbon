@@ -9,7 +9,7 @@ import {
 } from "@gd/ui"
 import { ModalProps, useModal } from "../.."
 import ModalLayout from "../../ModalLayout"
-import { rspc } from "@/utils/rspcClient"
+import { extractErrorDisplay, rspc } from "@/utils/rspcClient"
 import { Show, createEffect, createSignal, createMemo } from "solid-js"
 import { Trans, useTransContext } from "@gd/i18n"
 import { Modpack } from "@gd/core_module/bindings"
@@ -37,25 +37,49 @@ const ModPackVersionUpdate = (props: ModalProps) => {
     mutationKey: ["instance.changeModpack"]
   }))
 
-  // Pure reactive memo - no side effects
-  const modpackData = createMemo(() => {
-    const modpack = instance.data?.modpack?.modpack
-    if (!modpack) return null
+  // Pure reactive memo - no side effects.
+  //
+  // `equals` is load-bearing, not an optimisation. `instance.getInstanceDetails`
+  // is invalidated continuously while any task runs on the instance, and each
+  // invalidation hands back a fresh object — so without a comparator this memo
+  // allocates a new `{platform, projectId, fileId}` every time and notifies,
+  // even when the pinned modpack has not changed at all. That cascades:
+  // `versions` recomputes into a new array, `options` below changes identity,
+  // and `Select` tears down and rebuilds its listbox items. The visible effect
+  // is that the open dropdown destroys and recreates the row under the user's
+  // cursor, mid-click, for as long as a task is in flight — which is exactly
+  // when someone is most likely to be changing versions.
+  //
+  // Comparing the three fields stops the cascade at its source: an
+  // invalidation that does not actually change the pinned pack does not
+  // propagate. Same primitive `DragContext.tsx` uses for the same reason.
+  const modpackData = createMemo(
+    () => {
+      const modpack = instance.data?.modpack?.modpack
+      if (!modpack) return null
 
-    if (modpack.type === "curseforge") {
-      return {
-        platform: "curseforge" as const,
-        projectId: modpack.value.project_id,
-        fileId: modpack.value.file_id
+      if (modpack.type === "curseforge") {
+        return {
+          platform: "curseforge" as const,
+          projectId: modpack.value.project_id,
+          fileId: modpack.value.file_id
+        }
+      } else {
+        return {
+          platform: "modrinth" as const,
+          projectId: modpack.value.project_id,
+          fileId: modpack.value.version_id
+        }
       }
-    } else {
-      return {
-        platform: "modrinth" as const,
-        projectId: modpack.value.project_id,
-        fileId: modpack.value.version_id
-      }
+    },
+    undefined,
+    {
+      equals: (prev, next) =>
+        prev?.platform === next?.platform &&
+        prev?.projectId === next?.projectId &&
+        prev?.fileId === next?.fileId
     }
-  })
+  )
 
   const currentPlatform = createMemo(() => modpackData()?.platform)
 
@@ -123,28 +147,36 @@ const ModPackVersionUpdate = (props: ModalProps) => {
     )
   })
 
+  const [updateError, setUpdateError] = createSignal<string | null>(null)
+
   const handleUpdate = async () => {
     const version = selectedVersion()
     const data = modpackData()
     const id = instanceId()
     if (!version || !data || !id) return
 
-    await changeModpackMutation.mutateAsync({
-      instance: id,
-      modpack: {
-        type: data.platform,
-        value:
-          data.platform === "curseforge"
-            ? {
-                project_id: data.projectId,
-                file_id: parseInt(version)
-              }
-            : {
-                project_id: data.projectId.toString(),
-                version_id: version
-              }
-      } as Modpack
-    })
+    setUpdateError(null)
+    try {
+      await changeModpackMutation.mutateAsync({
+        instance: id,
+        modpack: {
+          type: data.platform,
+          value:
+            data.platform === "curseforge"
+              ? {
+                  project_id: data.projectId,
+                  file_id: parseInt(version)
+                }
+              : {
+                  project_id: data.projectId.toString(),
+                  version_id: version
+                }
+        } as Modpack
+      })
+    } catch (e) {
+      setUpdateError(extractErrorDisplay(e))
+      return
+    }
 
     modalContext?.closeModal()
     navigator.navigate("/library")
@@ -173,7 +205,11 @@ const ModPackVersionUpdate = (props: ModalProps) => {
               )
               return (
                 <SelectItem item={itemProps.item}>
-                  <div class="flex w-full justify-between">
+                  <div
+                    class="flex w-full justify-between"
+                    data-testid="modpack-version-option"
+                    data-version-id={itemProps.item.rawValue}
+                  >
                     <span>{version?.name}</span>
                     <Show when={version?.isCurrent}>
                       <span class="text-green-500">
@@ -185,7 +221,10 @@ const ModPackVersionUpdate = (props: ModalProps) => {
               )
             }}
           >
-            <SelectTrigger class="bg-darkSlate-800 w-full">
+            <SelectTrigger
+              class="bg-darkSlate-800 w-full"
+              data-testid="modpack-version-select"
+            >
               <SelectValue<string>>
                 {(state) => {
                   const selectedId = state.selectedOption()
@@ -206,6 +245,20 @@ const ModPackVersionUpdate = (props: ModalProps) => {
             <SelectContent />
           </Select>
 
+          <Show when={updateError()}>
+            <div
+              data-testid="modpack-version-update-error"
+              class="mt-2 rounded-lg border border-red-600/30 bg-red-900/20 p-3 text-sm text-red-300"
+            >
+              <div class="font-semibold">
+                <Trans key="instances:_trn_change_version_failed" />
+              </div>
+              <div class="mt-1 max-h-40 overflow-y-auto break-words">
+                {updateError()}
+              </div>
+            </div>
+          </Show>
+
           <div class="flex justify-between">
             <Button
               type="secondary"
@@ -217,8 +270,9 @@ const ModPackVersionUpdate = (props: ModalProps) => {
             </Button>
             <Button
               type="primary"
+              data-testid="modpack-version-update-confirm"
               onClick={handleUpdate}
-              disabled={!selectedVersion()}
+              disabled={!selectedVersion() || changeModpackMutation.isPending}
             >
               {t("instances:_trn_instance_modal_instance_update")}
             </Button>

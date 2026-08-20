@@ -209,6 +209,7 @@ const Settings = () => {
             <Show when={routeData.instanceDetails.data?.modpack?.locked}>
               <Button
                 type="secondary"
+                data-testid="instance-settings-unlock"
                 onClick={() => {
                   searchContext?.setSelectedInstanceId(parseInt(params.id, 10))
                   // modalsContext?.openModal(
@@ -240,6 +241,7 @@ const Settings = () => {
             </Show>
             <Button
               type="secondary"
+              data-testid="instance-settings-unpair"
               onClick={() => {
                 searchContext?.setSelectedInstanceId(parseInt(params.id, 10))
                 modalsContext?.openModal(
@@ -258,6 +260,7 @@ const Settings = () => {
             </Button>
             <Button
               type="secondary"
+              data-testid="instance-settings-change-version"
               onClick={() => {
                 modalsContext?.openModal(
                   {
@@ -277,7 +280,7 @@ const Settings = () => {
       </Show>
       <Row>
         <Title>
-          <Trans key="instances:_trn_instance_settings.reinstall" />
+          <Trans key="instances:_trn_instance_settings.repair" />
         </Title>
         <RightHandSide>
           <Button
@@ -286,7 +289,7 @@ const Settings = () => {
             onClick={() => {
               modalsContext?.openModal(
                 {
-                  name: "confirmReinstall"
+                  name: "repairModpack"
                 },
                 {
                   id: parseInt(params.id, 10),
@@ -297,7 +300,7 @@ const Settings = () => {
             }}
           >
             <i class="i-hugeicons:refresh h-5 w-5" />
-            <Trans key="instances:_trn_instance_settings.reinstall" />
+            <Trans key="instances:_trn_instance_settings.repair" />
           </Button>
         </RightHandSide>
       </Row>
@@ -434,6 +437,20 @@ const Settings = () => {
             </div>
           </Match>
         </SolidSwitch>
+        <Show when={routeData?.instanceDetails?.data?.javaOverrideMismatch}>
+          <div class="mt-2 flex items-start gap-2 text-yellow-500">
+            <div class="i-hugeicons:alert-02 mt-0.5 h-4 w-4 shrink-0" />
+            <p class="m-0 text-sm">
+              <Trans
+                key="java:_trn_instance_settings.java_override_mismatch"
+                options={{
+                  defaultValue:
+                    "The selected Java doesn't match the version this instance requires. Minecraft may fail to start; pick a matching Java or turn on automatic Java management."
+                }}
+              />
+            </p>
+          </div>
+        </Show>
       </Show>
       <Row>
         <Title>

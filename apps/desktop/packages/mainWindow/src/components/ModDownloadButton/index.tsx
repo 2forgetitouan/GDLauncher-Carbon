@@ -3,11 +3,13 @@ import { Switch, Match, createSignal, createEffect, createMemo } from "solid-js"
 import {
   FEUnifiedSearchResult,
   Mod,
+  Progress,
   ServerAddon
 } from "@gd/core_module/bindings"
 import { useModInstallation } from "./hooks/useModInstallation"
 import { useInstanceSearch } from "./hooks/useInstanceSearch"
 import { useTaskProgress } from "./hooks/useTaskProgress"
+import { resolveTaskPoll } from "./hooks/resolveTaskPoll"
 import { InstanceDropdown } from "./components/InstanceDropdown"
 import { InstallButton } from "./components/InstallButton"
 import { toast } from "@gd/ui"
@@ -24,11 +26,20 @@ interface ModDownloadButtonProps {
   selectedServerId?: number
   size?: "small" | "medium" | "large"
   iconOnly?: boolean
+  /** Opt-in anchor for the rendered install/download button, forwarded to
+   *  `InstallButton`. Left unset everywhere this component can render more
+   *  than one instance for different addons at once (search result lists,
+   *  version rows) — an anchor there would match every one of them. Set
+   *  only by the addon page's primary header button; the page's own sticky
+   *  icon-only duplicate of the same addon's button deliberately leaves it
+   *  unset too, for the same reason. */
+  testId?: string
 }
 
 const ModDownloadButton = (props: ModDownloadButtonProps) => {
   const [t] = useTransContext()
   const [taskId, setTaskId] = createSignal<number | null>(null)
+  const [pendingInstall, setPendingInstall] = createSignal(false)
 
   const {
     instanceLoadingStates,
@@ -58,6 +69,19 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
     props.addon
   )
 
+  // Last non-`Indeterminate`/`null` progress seen for the tracked task. Used
+  // to tell a genuine completion (progress goes `Known` then the task is
+  // forgotten, `data` becomes `null`) apart from a task that failed and was
+  // then dismissed (`data` also becomes `null` once forgotten) — only the
+  // former should trigger the success toast below. Reset alongside `taskId`
+  // whenever a new task starts being tracked (the two effects right below)
+  // and when a tracked task is dismissed after failing (the poll effect's
+  // `"failed"` branch further down) — otherwise a `Failed` observed for one
+  // task would keep suppressing the success toast for whatever task gets
+  // tracked next. Mirrors `useTaskProgress.ts`'s per-instance map, which
+  // retires its own entry the same way on both failure and completion.
+  const [lastProgress, setLastProgress] = createSignal<Progress | null>(null)
+
   createEffect(() => {
     if (installLatestModMutation.isPending) {
       setLoading(true)
@@ -65,6 +89,7 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
 
     if (installLatestModMutation.isSuccess) {
       setTaskId(installLatestModMutation.data)
+      setLastProgress(null)
     }
   })
 
@@ -75,6 +100,7 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
 
     if (installModMutation.isSuccess) {
       setTaskId(installModMutation.data)
+      setLastProgress(null)
     }
   })
 
@@ -84,15 +110,52 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
     enabled: taskId() !== null
   }))
 
+  const dismissTaskMutation = rspc.createMutation(() => ({
+    mutationKey: ["vtask.dismissTask"]
+  }))
+
   createEffect(() => {
-    if (taskId() !== null) {
-      if (task?.data?.progress.type === "Known") {
-        setProgress(Math.round(task?.data?.progress.value * 100))
-      } else if (task?.data === null) {
-        setLoading(false)
-        setTaskId(null)
-        setProgress(null)
+    if (taskId() === null) return
+
+    const { action, nextLastProgress } = resolveTaskPoll(
+      task?.data,
+      lastProgress(),
+      props.addon?.type === "world"
+    )
+    setLastProgress(nextLastProgress)
+
+    if (action.kind === "progress") {
+      setProgress(action.percent)
+    } else if (action.kind === "failed") {
+      toast.error(
+        t("notifications:_trn_addon_install_failed", {
+          title: props.addon?.title || t("notifications:_trn_addon_fallback_name")
+        }),
+        action.message ? { description: action.message } : undefined
+      )
+      setLoading(false)
+      setPendingInstall(false)
+      const failedTaskId = taskId()
+      setTaskId(null)
+      setProgress(null)
+      // Retire the failure from `lastProgress` too — otherwise it would
+      // outlive this task and suppress the success toast of whatever gets
+      // tracked next (see this signal's own doc comment above).
+      setLastProgress(null)
+      if (failedTaskId !== null) {
+        dismissTaskMutation.mutate(failedTaskId)
       }
+    } else if (action.kind === "completed") {
+      if (action.showSuccessToast) {
+        toast.success(
+          `${props.addon?.title || "World"} installed successfully`,
+          { duration: 2000 }
+        )
+      }
+      setLoading(false)
+      setTaskId(null)
+      setProgress(null)
+      setPendingInstall(false)
     }
   })
 
@@ -202,39 +265,38 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
       return
     }
 
-    if (!props.fileId) {
-      await installLatestModMutation.mutateAsync({
-        instance_id: instanceId,
-        mod_source: latestModInstallObj()
-      })
-    } else {
-      const replacesMod = installedMod()?.id || null
+    setPendingInstall(true)
+    try {
+      if (!props.fileId) {
+        await installLatestModMutation.mutateAsync({
+          instance_id: instanceId,
+          mod_source: latestModInstallObj()
+        })
+      } else {
+        const replacesMod = installedMod()?.id || null
 
-      await installModMutation.mutateAsync({
-        mod_source: modInstallObj(),
-        instance_id: instanceId,
-        install_deps: !replacesMod,
-        replaces_mod: replacesMod
-      })
+        await installModMutation.mutateAsync({
+          mod_source: modInstallObj(),
+          instance_id: instanceId,
+          install_deps: !replacesMod,
+          replaces_mod: replacesMod
+        })
+      }
+    } catch {
+      // Error surfaced via global MutationCache.onError
+      setPendingInstall(false)
+      setLoading(false)
+      setProgress(null)
     }
   }
 
   // Watch for installation completion and clear states reactively
   const [wasInstalled, setWasInstalled] = createSignal(false)
-  const [wasLoading, setWasLoading] = createSignal(false)
   const [isInitialized, setIsInitialized] = createSignal(false)
 
   createEffect(() => {
     const installed = isInstalled()
-    const isCurrentlyLoading = loading()
     const isWorld = props.addon?.type === "world"
-
-    // For worlds: show toast when loading finishes (since they never show as "installed")
-    if (isWorld && wasLoading() && !isCurrentlyLoading && taskId() === null) {
-      toast.success(`${props.addon?.title || "World"} installed successfully`, {
-        duration: 2000
-      })
-    }
 
     // For other addon types: show toast when transitioning from not installed to installed
     // Skip on initial mount to avoid showing toast for already-installed versions
@@ -249,10 +311,15 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
       setWasInstalled(installed)
     }
 
-    // Track loading state changes
-    setWasLoading(isCurrentlyLoading)
-
-    if (installed || (isWorld && taskId() === null)) {
+    // For worlds, `taskId() === null` conflates "the install has not started
+    // yet" with "the install finished". `pendingInstall` marks the
+    // not-yet-tracked window between click (when `loading` flips true) and
+    // vtask completion, closing the gap. Only clear loading here if the
+    // install genuinely finished (`pendingInstall` false means either the
+    // vtask poll's null branch already ran, or the attempt failed and the
+    // catch cleared it). For toast delivery, see vtask-poll effect above
+    // (apps/desktop/e2e-tests/helpers/mods.ts:installModIntoInstance).
+    if (installed || (isWorld && !pendingInstall() && taskId() === null)) {
       setLoading(false)
       setTaskId(null)
       setProgress(null)
@@ -277,6 +344,7 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
           onDownload={handleDownload}
           size={props.size}
           iconOnly={props.iconOnly}
+          testId={props.testId}
         />
       </Match>
       <Match when={!props.selectedInstanceId}>
@@ -307,6 +375,7 @@ const ModDownloadButton = (props: ModDownloadButtonProps) => {
           onDownload={handleDownload}
           size={props.size}
           iconOnly={props.iconOnly}
+          testId={props.testId}
         />
       </Match>
     </Switch>

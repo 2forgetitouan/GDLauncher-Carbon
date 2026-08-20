@@ -15,7 +15,10 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, trace, warn};
 
-use super::modrinth::secure_path_join;
+use super::modrinth::{
+    MAX_EXTRACTED_OVERRIDE_BYTES, MAX_HASHED_ENTRY_BYTES, copy_bounded, is_symlink_mode,
+    secure_path_join,
+};
 
 use crate::domain::instance::info::{ModLoader, ModLoaderType, StandardVersion};
 
@@ -44,6 +47,28 @@ struct ResolvedFile {
 /// Batch size for API calls (both platforms support up to 1000)
 const BATCH_SIZE: usize = 1000;
 
+/// Picks the hash a resolved file's download is verified against.
+///
+/// `platform_sha1` describes exactly what the platform's CDN will serve, so it
+/// wins when present. It often isn't: CurseForge's fingerprint results carry a
+/// SHA-1 only sometimes, and a gdlpack written by another launcher's exporter
+/// need not populate `sha1` at all, since Modrinth resolution only needs
+/// `sha512` and CurseForge only needs `murmur2`. Each remaining digest is
+/// therefore taken from the manifest in strength order, and an absent hash
+/// yields `None` — attaching an empty one would fail every download it was
+/// meant to protect, with a mismatch no retry could clear.
+fn download_checksum(platform_sha1: &str, manifest: &FileHashes) -> Option<carbon_net::Checksum> {
+    if !platform_sha1.is_empty() {
+        Some(carbon_net::Checksum::Sha1(platform_sha1.to_string()))
+    } else if !manifest.sha512.is_empty() {
+        Some(carbon_net::Checksum::Sha512(manifest.sha512.clone()))
+    } else if !manifest.sha1.is_empty() {
+        Some(carbon_net::Checksum::Sha1(manifest.sha1.clone()))
+    } else {
+        None
+    }
+}
+
 /// Batch resolve files from Modrinth using SHA512 hashes
 /// Returns a map of SHA512 -> (download_url, relative_path)
 async fn batch_resolve_modrinth(
@@ -65,7 +90,12 @@ async fn batch_resolve_modrinth(
             .await?;
 
         for (sha512, version) in versions {
-            // Find the file that matches our hash
+            // Find the file that matches our hash. `sha512` is the key Modrinth
+            // echoes back from the query, so it carries the gdlpack manifest's
+            // casing (already folded lowercase by `deserialize_lowercase_hex`),
+            // and `file.hashes.sha512` carries Modrinth's own, folded lowercase
+            // the same way at deserialize (`carbon_platforms::modrinth::version::Hashes`)
+            // — both sides are guaranteed lowercase, so a plain comparison suffices.
             for file in &version.files {
                 if file.hashes.sha512 == sha512 {
                     let relative_path = format!("mods/{}", file.filename);
@@ -189,7 +219,7 @@ pub async fn prepare_modpack_from_gdlpack(
             *state = ProgressState::ResolvingFiles(0, total_files);
         });
 
-        // Step 1: Batch resolve from Modrinth (primary source)
+        // Resolve from Modrinth first — the primary source.
         debug!("Resolving {} files from Modrinth", platform_files.len());
         let modrinth_results = match batch_resolve_modrinth(app, &platform_files).await {
             Ok(results) => {
@@ -208,14 +238,14 @@ pub async fn prepare_modpack_from_gdlpack(
             *state = ProgressState::ResolvingFiles(total_files / 2, total_files);
         });
 
-        // Step 2: Collect files not found in Modrinth for CurseForge lookup
+        // Collect the files Modrinth didn't resolve, to look up on CurseForge.
         let not_in_modrinth: Vec<FileHashes> = platform_files
             .iter()
             .filter(|h| !modrinth_results.contains_key(&h.sha512))
             .cloned()
             .collect();
 
-        // Step 3: Batch resolve remaining from CurseForge
+        // Resolve the remainder from CurseForge.
         let curseforge_results = if !not_in_modrinth.is_empty() {
             debug!(
                 "Resolving {} remaining files from CurseForge",
@@ -243,7 +273,7 @@ pub async fn prepare_modpack_from_gdlpack(
             *state = ProgressState::ResolvingFiles(total_files, total_files);
         });
 
-        // Step 4: Build downloadables from resolved files
+        // Build downloadables from the resolved files.
         for hashes in &platform_files {
             // Try Modrinth first, then CurseForge
             let resolved = modrinth_results
@@ -264,15 +294,8 @@ pub async fn prepare_modpack_from_gdlpack(
                             .map(|(p, _)| p.clone())
                     });
 
-                    // Prefer SHA1 from platform, fall back to manifest
-                    let sha1 = if !file.sha1.is_empty() {
-                        file.sha1.clone()
-                    } else {
-                        hashes.sha1.clone()
-                    };
-
                     let downloadable = Downloadable::new(&file.download_url, target_path)
-                        .with_checksum(Some(carbon_net::Checksum::Sha1(sha1)))
+                        .with_checksum(download_checksum(&file.sha1, hashes))
                         .with_size(file.size);
 
                     downloadables.push((downloadable, skip_path));
@@ -333,9 +356,16 @@ pub async fn prepare_modpack_from_gdlpack(
                             continue;
                         }
 
-                        // Read file and compute SHA512
+                        // Read file and compute SHA512. Bounded per-entry (not
+                        // cumulative -- `contents` is dropped at the end of each
+                        // iteration, so there is nothing to accumulate): a
+                        // decompression bomb masquerading as an override must not
+                        // be read into memory without limit just to hash it, and an
+                        // entry over the limit can never legitimately be the small
+                        // unresolved file we are matching against anyway.
                         let mut contents = Vec::new();
-                        if entry.read_to_end(&mut contents).is_err() {
+                        if copy_bounded(&mut entry, &mut contents, MAX_HASHED_ENTRY_BYTES).is_err()
+                        {
                             continue;
                         }
 
@@ -343,7 +373,9 @@ pub async fn prepare_modpack_from_gdlpack(
                         let hash = Sha512::digest(&contents);
                         let hash_hex = hex::encode(hash);
 
-                        if hash_hex == hashes.sha512 {
+                        // `hash_hex` is lowercase by construction; `hashes.sha512`
+                        // is whatever the gdlpack manifest declared.
+                        if hash_hex.eq_ignore_ascii_case(&hashes.sha512) {
                             found = true;
                             trace!(
                                 "Found unresolved platform file in overrides: {} (SHA512: {})",
@@ -419,6 +451,10 @@ pub async fn prepare_modpack_from_gdlpack(
                     .count() as u64;
 
                 let mut extracted = 0u64;
+                // Cumulative across the whole pass, not per entry: without this,
+                // many entries each just under a per-entry cap could still add up
+                // to an unbounded amount written to disk.
+                let mut extracted_bytes: u64 = 0;
 
                 // Extract main overrides
                 for i in 0..archive.len() {
@@ -445,6 +481,17 @@ pub async fn prepare_modpack_from_gdlpack(
                             continue;
                         }
 
+                        if is_symlink_mode(entry.unix_mode()) {
+                            // A symlink entry materialized as a regular file would end
+                            // up containing the link's target path text instead of
+                            // real data.
+                            tracing::warn!(
+                                "Skipping gdlpack override entry `{}`: symlinks are not extracted",
+                                rel_path
+                            );
+                            continue;
+                        }
+
                         let target = match secure_path_join(&instance_data_path, &rel_path) {
                             Ok(p) => p,
                             Err(e) => {
@@ -462,7 +509,10 @@ pub async fn prepare_modpack_from_gdlpack(
                         }
 
                         let mut outfile = std::fs::File::create(&target)?;
-                        std::io::copy(&mut entry, &mut outfile)?;
+                        let remaining_budget =
+                            MAX_EXTRACTED_OVERRIDE_BYTES.saturating_sub(extracted_bytes);
+                        extracted_bytes +=
+                            copy_bounded(&mut entry, &mut outfile, remaining_budget)?;
 
                         extracted += 1;
                         progress_sender.send_modify(|state| {
@@ -503,4 +553,50 @@ pub async fn prepare_modpack_from_gdlpack(
         version,
         downloadables,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_hashes(sha512: &str, sha1: &str) -> FileHashes {
+        FileHashes {
+            sha512: sha512.to_string(),
+            sha1: sha1.to_string(),
+            murmur2: 1,
+        }
+    }
+
+    #[test]
+    fn the_platform_sha1_wins_when_the_platform_supplied_one() {
+        match download_checksum("platform-sha1", &manifest_hashes("mr-sha512", "mr-sha1")) {
+            Some(carbon_net::Checksum::Sha1(hash)) => assert_eq!(hash, "platform-sha1"),
+            other => panic!("expected the platform SHA-1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_manifest_sha512_covers_a_platform_that_reported_no_sha1() {
+        // CurseForge fingerprint matches carry a SHA-1 only sometimes.
+        match download_checksum("", &manifest_hashes("mr-sha512", "mr-sha1")) {
+            Some(carbon_net::Checksum::Sha512(hash)) => assert_eq!(hash, "mr-sha512"),
+            other => panic!("expected the manifest SHA-512, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_manifest_sha1_is_the_last_resort() {
+        match download_checksum("", &manifest_hashes("", "mr-sha1")) {
+            Some(carbon_net::Checksum::Sha1(hash)) => assert_eq!(hash, "mr-sha1"),
+            other => panic!("expected the manifest SHA-1, got {other:?}"),
+        }
+    }
+
+    /// A foreign exporter may populate only `murmur2`, which resolves on
+    /// CurseForge without any digest. Verification is then skipped rather than
+    /// run against an empty hash, which would fail every such download.
+    #[test]
+    fn a_file_with_no_digest_anywhere_is_left_unverified() {
+        assert!(download_checksum("", &manifest_hashes("", "")).is_none());
+    }
 }

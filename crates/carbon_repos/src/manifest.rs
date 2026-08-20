@@ -1,6 +1,6 @@
-//! Derived migration metadata: `kind` and lossiness (spec §10.2-10.3).
+//! Derived migration metadata: `kind` and lossiness.
 //!
-//! Task 2's [`crate::downgen`] generates the `down.sql` and flags the rename /
+//! [`crate::downgen`] generates the `down.sql` and flags the rename /
 //! DML touchpoints. This module derives — never trusts — the two remaining
 //! metadata fields a migration carries, so a declaration in `get_migrations()`
 //! that disagrees with what the engine actually attests is a CI failure:
@@ -164,7 +164,7 @@ fn quote(ident: &str) -> String {
 }
 
 // ------------------------------------------------------------------------
-// Kind derivation (spec §10.2)
+// Kind derivation
 // ------------------------------------------------------------------------
 
 /// The derived kind plus the concrete reasons a migration is `Breaking` (empty
@@ -181,6 +181,42 @@ pub struct KindDerivation {
 /// kind is [`KindDerivation::kind`].
 pub fn derive_kind(prev_ups: &[&str], up: &str) -> DbResult<MigrationKind> {
     Ok(derive_kind_explained(prev_ups, up)?.kind)
+}
+
+/// One foreign key whose `ON DELETE` action rejects, rather than resolves, a
+/// delete of the parent row.
+struct RestrictingFk {
+    parent: String,
+    /// The declared action, as SQLite reports it.
+    action: String,
+}
+
+/// Reads `table`'s foreign keys and keeps those whose `ON DELETE` action refuses
+/// the parent delete. `CASCADE`, `SET NULL` and `SET DEFAULT` resolve it and so
+/// cannot reject an old binary; `RESTRICT` and `NO ACTION` (what SQLite reports
+/// when the clause is omitted) refuse it.
+///
+/// `ON UPDATE` is deliberately not consulted. It restricts updates to the
+/// *referenced key*, which here is always a synthetic primary key the app never
+/// rewrites, and SQLite reports an omitted clause as `NO ACTION` — so treating
+/// it as breaking would classify nearly every foreign key that way and route
+/// routine migrations down the down-run path for a write nothing performs.
+fn read_restricting_fks(conn: &Connection, table: &str) -> DbResult<Vec<RestrictingFk>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({})", quote(table)))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(2)?, // parent table
+                r.get::<_, String>(6)?, // on_delete
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows
+        .into_iter()
+        .filter(|(_, on_delete)| matches!(on_delete.as_str(), "RESTRICT" | "NO ACTION"))
+        .map(|(parent, action)| RestrictingFk { parent, action })
+        .collect())
 }
 
 /// Kind derivation with the breaking reasons attached.
@@ -248,6 +284,37 @@ pub fn derive_kind_explained(prev_ups: &[&str], up: &str) -> DbResult<KindDeriva
         }
     }
 
+    // --- foreign keys introduced by brand-new tables ---
+    // A new table is invisible to an old binary, but a foreign key it declares
+    // against a pre-existing parent is not: a restricting action makes the
+    // engine reject the old binary's delete or key update on that parent. The
+    // loop above only walks `old_tables`, so this is the one constraint class a
+    // wholly-new object can impose on the old schema.
+    //
+    // `PRAGMA foreign_key_list` reports the parent exactly as written in the
+    // `REFERENCES` clause, which need not match the referenced table's own
+    // declared case (`REFERENCES instance(id)` against a table declared
+    // `Instance`). SQLite identifiers are ASCII-case-insensitive — and SQLite
+    // itself refuses two tables whose names differ only by case — so folding
+    // both sides here cannot conflate genuinely distinct tables; it only stops
+    // a same-table reference from being missed. Also reused by the trigger
+    // check below, which has the identical hazard against `tbl_name`.
+    let old_table_names_ci: BTreeSet<String> =
+        old_tables.keys().map(|n| n.to_ascii_lowercase()).collect();
+    for name in new_tables.keys() {
+        if old_tables.contains_key(name) {
+            continue;
+        }
+        for fk in read_restricting_fks(&new_conn, name)? {
+            if old_table_names_ci.contains(&fk.parent.to_ascii_lowercase()) {
+                reasons.push(format!(
+                    "new table `{name}` declares ON DELETE {} against pre-existing table `{}`",
+                    fk.action, fk.parent
+                ));
+            }
+        }
+    }
+
     // --- indexes ---
     for (name, old_i) in &old_idx {
         match new_idx.get(name) {
@@ -272,7 +339,11 @@ pub fn derive_kind_explained(prev_ups: &[&str], up: &str) -> DbResult<KindDeriva
         }
     }
     for (name, (tbl, _)) in &new_trg {
-        if !old_trg.contains_key(name) && old_tables.contains_key(tbl) {
+        // `sqlite_master.tbl_name` for a trigger is its `ON` clause's
+        // spelling verbatim, not resolved to the table's declared case —
+        // the same hazard as the FK-parent check above, so it folds through
+        // the same `old_table_names_ci` lookup.
+        if !old_trg.contains_key(name) && old_table_names_ci.contains(&tbl.to_ascii_lowercase()) {
             reasons.push(format!(
                 "new trigger `{name}` on pre-existing table `{tbl}`"
             ));
@@ -368,7 +439,7 @@ fn render_col_def(col: &Col) -> String {
 }
 
 // ------------------------------------------------------------------------
-// Lossiness declaration + derivation (spec §10.3)
+// Lossiness declaration + derivation
 // ------------------------------------------------------------------------
 
 /// The parsed `data_down` declaration a migration carries. `Full` means the
@@ -542,7 +613,7 @@ pub fn verify_data_down(
 }
 
 // ------------------------------------------------------------------------
-// Seeded boundary-value round-trip (spec §10.3 item 4 / CI T5)
+// Seeded boundary-value round-trip
 // ------------------------------------------------------------------------
 
 /// Seeds every table of `S(n-1)` with deterministic boundary-value rows in
@@ -689,6 +760,19 @@ fn read_table_rows(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Finds `key` among `map`'s keys case-insensitively (SQLite identifiers are
+/// ASCII-case-insensitive) and returns the matching canonical-cased
+/// `(key, value)` pair, or `None`. `PRAGMA foreign_key_list` reports a
+/// foreign key's parent exactly as written in the `REFERENCES` clause, which
+/// need not match the parent table's own declared case, so every
+/// pragma-derived parent name the seeder resolves against a canonically-keyed
+/// map must go through this instead of a plain `.get`/`.contains_key` — or a
+/// case-variant reference silently misses the very table its own database
+/// treats it as referencing.
+fn ci_lookup<'a, V>(map: &'a BTreeMap<String, V>, key: &str) -> Option<(&'a String, &'a V)> {
+    map.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
+}
+
 /// Orders `tables` so every table sorts after all tables it references by a
 /// foreign key (parents before children). Self-references are ignored; a
 /// reference cycle falls back to name order for the tables it entangles (the
@@ -706,8 +790,10 @@ fn fk_topological_order(
             .collect::<Result<Vec<_>, _>>()?;
         let set = parents.entry(name.clone()).or_default();
         for parent in refs {
-            if &parent != name && tables.contains_key(&parent) {
-                set.insert(parent);
+            if let Some((canonical, _)) = ci_lookup(tables, &parent) {
+                if canonical != name {
+                    set.insert(canonical.clone());
+                }
             }
         }
     }
@@ -752,18 +838,25 @@ fn seed_table(
     // Columns that must be unique (primary key or any unique index member).
     let unique_cols = unique_column_set(conn, table, tbl)?;
 
-    // Four rows so a NOT NULL column sees every integer boundary (0, -1,
-    // i64::MAX, i64::MIN) and both string/blob boundaries; every table gets the
-    // same count, so a child in FK-topological order always finds enough
-    // distinct parent rows to key against.
-    let rows_per_table = 4;
+    // Five rows so a NOT NULL column sees every integer boundary (0, -1,
+    // i64::MAX, i64::MIN) and every string/blob boundary, plus a fifth row
+    // exercising a mixed-case ASCII string and, for DATETIME-declared columns,
+    // a TEXT-shaped datetime value; every table gets the same count, so a
+    // child in FK-topological order always finds enough distinct parent rows
+    // to key against.
+    let rows_per_table = 5;
     let mut rows = Vec::new();
     for row_i in 0..rows_per_table {
         let mut row: BTreeMap<String, Value> = BTreeMap::new();
 
         // Foreign-key columns first: reference a distinct parent row per row_i.
         for fk in &fks {
-            let parent_rows = inserted.get(&fk.parent);
+            // `fk.parent` is `PRAGMA foreign_key_list`'s literal spelling of
+            // the `REFERENCES` clause, which may differ in case from the
+            // canonical key `inserted` is keyed by — resolve case-
+            // insensitively so a case-variant reference still finds the
+            // parent rows already seeded for it.
+            let parent_rows = ci_lookup(inserted, &fk.parent).map(|(_, rows)| rows);
             match parent_rows.filter(|r| !r.is_empty()) {
                 Some(parent_rows) => {
                     let parent = &parent_rows[row_i % parent_rows.len()];
@@ -894,6 +987,17 @@ fn boundary_value(col: &Col, row_i: usize, must_be_unique: bool, counter: &mut i
 
     match affinity {
         Affinity::Integer | Affinity::Numeric => {
+            // A DATETIME-declared column's 5th row is a TEXT datetime string
+            // rather than another integer boundary: `DbDateTime` stores these
+            // as epoch-millis integers, but a TEXT-shaped datetime value is a
+            // real representation this column's declared type admits, and
+            // nothing else here ever seeds one. A future down that only
+            // handles the integer shape (e.g. an arithmetic rewrite) would
+            // otherwise pass this round-trip proof by never encountering the
+            // shape it mishandles.
+            if row_i == 4 && is_datetime_declared(&col.ctype) {
+                return Value::Text("2024-04-10 20:56:05".to_string());
+            }
             let choices = [0i64, -1, i64::MAX, i64::MIN];
             Value::Integer(choices[row_i % choices.len()])
         }
@@ -902,9 +1006,19 @@ fn boundary_value(col: &Col, row_i: usize, must_be_unique: bool, counter: &mut i
             Value::Real(choices[row_i % choices.len()])
         }
         Affinity::Text => {
-            // Empty string and unicode-nasty strings (no embedded NUL — SQLite
-            // truncates TEXT at NUL; NUL bytes are exercised in BLOB columns).
-            let choices = ["", "café🔥\u{1F9FF}'\"\\—", "  spaced  ", "𝕏𝕐𝕫"];
+            // Empty string, unicode-nasty strings (no embedded NUL — SQLite
+            // truncates TEXT at NUL; NUL bytes are exercised in BLOB columns),
+            // and a mixed-case ASCII string: without it, every prior choice is
+            // either already lowercase or has no case at all, so a future down
+            // that silently lowercases (or uppercases) a TEXT column would
+            // falsely verify as lossless.
+            let choices = [
+                "",
+                "café🔥\u{1F9FF}'\"\\—",
+                "  spaced  ",
+                "𝕏𝕐𝕫",
+                "AbC xYz 0Z",
+            ];
             Value::Text(choices[row_i % choices.len()].to_string())
         }
         Affinity::Blob => {
@@ -944,6 +1058,17 @@ fn type_affinity(ctype: &str) -> Affinity {
         // BOOLEAN, DATETIME, NUMERIC, DECIMAL, … → NUMERIC affinity.
         Affinity::Numeric
     }
+}
+
+/// True when `ctype`'s declared type names a DATE/TIME column, case-
+/// insensitively — the `DATETIME` columns [`crate::dbtypes::DbDateTime`]
+/// stores as epoch-millis integers, which [`type_affinity`] buckets under
+/// `Numeric` (no `INT`/`CHAR`/`CLOB`/`TEXT`/`BLOB`/`REAL`/`FLOA`/`DOUB`
+/// substring matches). Used only to pick the boundary seeder's 5th-row value
+/// for such a column; it is not a distinct [`Affinity`] variant.
+fn is_datetime_declared(ctype: &str) -> bool {
+    let t = ctype.to_ascii_uppercase();
+    t.contains("DATE") || t.contains("TIME")
 }
 
 /// Inserts one fully-specified row.

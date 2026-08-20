@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use rspc::RouterBuilder;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use specta::Type;
 use std::sync::Arc;
 use tracing::error;
@@ -88,6 +88,7 @@ pub struct ListServer {
     modloader_type: Option<String>,
     modloader_version: Option<String>,
     modpack_info: Option<FEServerModpackInfo>,
+    auto_restart_abandoned: bool,
 }
 
 #[derive(Type, Debug, Serialize)]
@@ -151,6 +152,7 @@ pub struct FEServerDetails {
     modloader_type: Option<String>,
     modloader_version: Option<String>,
     modpack_info: Option<FEServerModpackInfo>,
+    auto_restart_abandoned: bool,
 }
 
 impl From<domain::ServerDetails> for FEServerDetails {
@@ -176,6 +178,7 @@ impl From<domain::ServerDetails> for FEServerDetails {
             modloader_type: d.modloader_type,
             modloader_version: d.modloader_version,
             modpack_info: d.modpack_info.map(FEServerModpackInfo::from),
+            auto_restart_abandoned: d.auto_restart_abandoned,
         }
     }
 }
@@ -199,6 +202,23 @@ struct CreateServer {
     modloader_version: Option<String>,
 }
 
+/// Deserialize an `Option<Option<T>>` field where an absent key means "leave
+/// unchanged" and an explicit `null` means "clear it" (the "double option"
+/// pattern). Plain derive(Deserialize) can't tell those apart: both an absent
+/// key and an explicit `null` collapse to the outer `None`, so a value could
+/// never actually be cleared. This function only runs when the key IS
+/// present (paired with `#[serde(default)]`, which supplies the outer `None`
+/// when it's absent), so a present `null` parses through `Option::deserialize`
+/// (giving `None`) and gets wrapped in `Some`, and a present value becomes
+/// `Some(Some(value))`.
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 #[derive(Type, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateServer {
@@ -206,6 +226,7 @@ struct UpdateServer {
     name: Option<String>,
     xmx: Option<i32>,
     xms: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     extra_java_args: Option<Option<String>>,
     auto_restart: Option<bool>,
 }
@@ -459,6 +480,8 @@ pub(super) fn mount() -> RouterBuilder<App> {
                             .get(&s.id)
                             .map(|sd| convert_state(&sd.state))
                             .unwrap_or(FEServerState::Stopped { failed_task: None });
+                        let auto_restart_abandoned =
+                            app.server_manager.is_auto_restart_abandoned(s.id);
 
                         ListServer {
                             id: FEServerId(s.id.0),
@@ -477,6 +500,7 @@ pub(super) fn mount() -> RouterBuilder<App> {
                             modloader_type: s.modloader_type,
                             modloader_version: s.modloader_version,
                             modpack_info: s.modpack_info.map(FEServerModpackInfo::from),
+                            auto_restart_abandoned,
                         }
                     })
                 })
@@ -707,6 +731,19 @@ pub(super) fn mount() -> RouterBuilder<App> {
         }
 
         mutation UPDATE_SERVER_PROPERTIES[app, req: UpdateServerProperties] {
+            // Reject a key or value containing a raw newline outright rather than
+            // silently stripping it: written verbatim into server.properties, an
+            // embedded `\n` turns one `key=value` pair into two lines, letting an
+            // attacker-controlled value inject an arbitrary second property (e.g.
+            // a hidden `online-mode=false` disabling Mojang auth).
+            for (key, value) in &req.properties {
+                if key.contains('\n') || key.contains('\r') || value.contains('\n') || value.contains('\r') {
+                    return Err(anyhow::anyhow!(
+                        "Property `{key}` contains a newline, which is not allowed in server.properties"
+                    ));
+                }
+            }
+
             app.server_manager()
                 .update_server_properties(req.id.into(), req.properties)
                 .await
@@ -1130,4 +1167,29 @@ async fn server_metrics_ws_handler(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_java_args_absent_leaves_it_unchanged() {
+        let parsed: UpdateServer = serde_json::from_str(r#"{"id":1}"#).unwrap();
+        assert_eq!(parsed.extra_java_args, None);
+    }
+
+    #[test]
+    fn extra_java_args_explicit_null_clears_it() {
+        let parsed: UpdateServer =
+            serde_json::from_str(r#"{"id":1,"extraJavaArgs":null}"#).unwrap();
+        assert_eq!(parsed.extra_java_args, Some(None));
+    }
+
+    #[test]
+    fn extra_java_args_value_sets_it() {
+        let parsed: UpdateServer =
+            serde_json::from_str(r#"{"id":1,"extraJavaArgs":"-Xss4m"}"#).unwrap();
+        assert_eq!(parsed.extra_java_args, Some(Some("-Xss4m".to_string())));
+    }
 }

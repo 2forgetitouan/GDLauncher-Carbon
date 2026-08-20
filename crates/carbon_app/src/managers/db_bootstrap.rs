@@ -21,8 +21,8 @@ pub enum DatabaseError {
     BackwardsMigration,
     #[error("database history diverged from this build at migration {0}")]
     Diverged(i32),
-    #[error("database downgrade failed; a snapshot was preserved at {0}")]
-    DowngradeFailed(String),
+    #[error("database downgrade failed and was rolled back{}", .0.as_ref().map(|p| format!("; a snapshot was preserved at {p}")).unwrap_or_default())]
+    DowngradeFailed(Option<String>),
     #[error("database file is corrupt or not a database")]
     Corrupt,
     #[error("database migration failed")]
@@ -31,7 +31,7 @@ pub enum DatabaseError {
 
 impl DatabaseError {
     /// True for the fatal DB outcomes whose `_STATUS_:` line the runner already
-    /// emitted through the funnel (spec §13). The caller exits cleanly on these:
+    /// emitted through the funnel. The caller exits cleanly on these:
     /// the status line is the single signal Electron consumes, so panicking
     /// after a clean emission would double-signal and bury it under a backtrace.
     pub fn is_emitted_db_status(&self) -> bool {
@@ -46,7 +46,7 @@ impl DatabaseError {
     }
 }
 
-/// The terminal DB status funnel (spec §13). Every fatal outcome of the
+/// The terminal DB status funnel. Every fatal outcome of the
 /// migration runner converts to one of these, and [`emit_status`] writes exactly
 /// one `_STATUS_:` line — the single place that formats them, so the emittable
 /// set is enumerable and test-locked. `Downgraded` is a non-fatal info line;
@@ -56,7 +56,9 @@ enum DbStatus {
     Downgraded,
     BackwardsMigration,
     Diverged(i32),
-    DowngradeFailed(String),
+    /// Carries the pre-downgrade snapshot only when restoring it would change
+    /// the database; the recovery screen hides its restore rung without one.
+    DowngradeFailed(Option<String>),
     Corrupt,
     MigrationFailed,
 }
@@ -70,7 +72,10 @@ impl DbStatus {
             DbStatus::Downgraded => "_STATUS_:DB_DOWNGRADED".to_string(),
             DbStatus::BackwardsMigration => "_STATUS_:BACKWARDS_MIGRATION".to_string(),
             DbStatus::Diverged(_) => "_STATUS_:DB_DIVERGED".to_string(),
-            DbStatus::DowngradeFailed(path) => format!("_STATUS_:DB_DOWNGRADE_FAILED|{path}"),
+            DbStatus::DowngradeFailed(Some(path)) => {
+                format!("_STATUS_:DB_DOWNGRADE_FAILED|{path}")
+            }
+            DbStatus::DowngradeFailed(None) => "_STATUS_:DB_DOWNGRADE_FAILED".to_string(),
             DbStatus::Corrupt => "_STATUS_:DB_CORRUPT".to_string(),
             DbStatus::MigrationFailed => "_STATUS_:DB_MIGRATION_FAILED".to_string(),
         }
@@ -92,7 +97,7 @@ impl DbStatus {
     }
 }
 
-/// The single stdout funnel point (spec §13): every DB status line passes
+/// The single stdout funnel point: every DB status line passes
 /// through here so no fatal path can bypass emission.
 fn emit_status(status: &DbStatus) {
     println!("{}", status.status_line());
@@ -101,7 +106,7 @@ fn emit_status(status: &DbStatus) {
 /// Maps the runner outcome to the funnel. `Ok(None)` proceeds silently;
 /// `Ok(Some(_))` is a non-fatal info line to emit; `Err(_)` is a fatal status to
 /// emit before aborting. Pure over its input, so the mapping is unit-tested per
-/// class — the "emission per class" assertion (spec §12 T10, §13 funnel).
+/// class — the "emission per class" assertion.
 fn classify_open(result: DbResult<OpenVerdict>) -> Result<Option<DbStatus>, DbStatus> {
     match result {
         Ok(OpenVerdict::Proceed) => Ok(None),
@@ -113,7 +118,7 @@ fn classify_open(result: DbResult<OpenVerdict>) -> Result<Option<DbStatus>, DbSt
             Err(DbStatus::Diverged(version))
         }
         Ok(OpenVerdict::Refuse(RefusalKind::DowngradeFailed { snapshot_path })) => Err(
-            DbStatus::DowngradeFailed(snapshot_path.display().to_string()),
+            DbStatus::DowngradeFailed(snapshot_path.map(|p| p.display().to_string())),
         ),
         Err(e) if is_corruption(&e) => Err(DbStatus::Corrupt),
         Err(_) => Err(DbStatus::MigrationFailed),
@@ -144,7 +149,7 @@ fn snapshot_path_for(db_path: &Path) -> PathBuf {
     db_path.with_file_name(format!("{stem}.pre-downgrade.db"))
 }
 
-/// Snapshot retention (spec §13): keep the single most recent pre-downgrade
+/// Snapshot retention: keep the single most recent pre-downgrade
 /// snapshot, delete it after the next fully-successful launch. Called once this
 /// build has opened the database cleanly; a snapshot older than `session_start`
 /// is from an earlier session and is now safe to drop, while one created during
@@ -195,10 +200,10 @@ pub(super) async fn load_and_migrate(
 
     debug!("Starting migration procedure");
 
-    // The runner (spec §9) applies pending migrations forward, overlays a newer
+    // The runner applies pending migrations forward, overlays a newer
     // additive schema, or steps a newer breaking schema back down under a
     // verified snapshot. Every outcome funnels through `classify_open` into a
-    // single `_STATUS_:` line (spec §13): a fatal outcome emits and aborts; a
+    // single `_STATUS_:` line: a fatal outcome emits and aborts; a
     // successful down-run emits the non-fatal `DB_DOWNGRADED` info line and
     // continues. `BACKWARDS_MIGRATION` keeps its exact meaning — a database
     // ahead of this build with no downgrade metadata (a pre-floor database).
@@ -215,8 +220,8 @@ pub(super) async fn load_and_migrate(
         }
     }
 
-    // Foreign keys have been OFF for the app's entire life (spec §2.3). Turn
-    // them ON behind a fail-safe sweep (spec §7): run it on a dedicated
+    // Foreign keys have been OFF for the app's entire life. Turn
+    // them ON behind a fail-safe sweep: run it on a dedicated
     // connection with FKs OFF (so repair deletes do not cascade), then open the
     // runtime pools with FKs ON only if the DB is — or was repaired — clean.
     // `GDL_DISABLE_FK_ENFORCEMENT=1` skips the sweep and forces FKs OFF.
@@ -229,7 +234,7 @@ pub(super) async fn load_and_migrate(
 
     seed_init_db(&db, latest_consent_sha).await?;
 
-    // Reached the successful-open point (spec §13 retention): drop a snapshot
+    // Reached the successful-open point: drop a snapshot
     // left by an earlier session now that this build has opened the database
     // cleanly. A snapshot from this session's own down-run is newer than
     // `session_start` and is kept.
@@ -246,6 +251,9 @@ pub(super) async fn load_and_migrate(
 /// bypasses the funnel.
 fn migrate_db(db_path: &Path, migration_set: &MigrationSet) -> DbResult<OpenVerdict> {
     let mut conn = rusqlite::Connection::open(db_path)?;
+    // Ride out a transient lock (an AV scan, a backup tool, or a just-exiting
+    // previous instance) rather than failing the migration instantly.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     // On Unix, restrict the DB (and -wal/-shm sidecars) to 0600 since they
     // contain MS access/refresh tokens.
@@ -301,7 +309,7 @@ fn migrate_db(db_path: &Path, migration_set: &MigrationSet) -> DbResult<OpenVerd
     Ok(verdict)
 }
 
-/// Runs the FK sweep (spec §7) and returns whether the runtime pools should
+/// Runs the FK sweep and returns whether the runtime pools should
 /// enable foreign-key enforcement. Never fails startup on integrity grounds: an
 /// unrepairable violation or a sweep error falls back to FKs OFF (today's
 /// behavior) and reports to Sentry, and the app continues.
@@ -314,6 +322,7 @@ fn decide_foreign_keys(db_path: &std::path::Path) -> Result<bool, anyhow::Error>
     }
 
     let mut sweep_conn = rusqlite::Connection::open(db_path)?;
+    sweep_conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // Match the migration connection: FKs OFF so repair deletes do not cascade
     // under the sweep (`foreign_key_check` works regardless of this pragma).
     sweep_conn.pragma_update(None, "foreign_keys", &"OFF")?;
@@ -484,7 +493,7 @@ async fn seed_init_db(
 mod test {
     use super::*;
 
-    // --- Status funnel (spec §13 / CI T10): every fatal DB class maps to
+    // --- Status funnel: every fatal DB class maps to
     // exactly one `_STATUS_:` line. `emit_status` is a single `println!` of
     // `status_line`, so locking the classification and the line text per class
     // is the "emission per class" assertion, verified in-process without
@@ -509,7 +518,8 @@ mod test {
         );
         assert_eq!(DbStatus::Diverged(7).status_line(), "_STATUS_:DB_DIVERGED");
         assert_eq!(
-            DbStatus::DowngradeFailed("/tmp/gdl_conf.pre-downgrade.db".to_string()).status_line(),
+            DbStatus::DowngradeFailed(Some("/tmp/gdl_conf.pre-downgrade.db".to_string()))
+                .status_line(),
             "_STATUS_:DB_DOWNGRADE_FAILED|/tmp/gdl_conf.pre-downgrade.db"
         );
         assert_eq!(DbStatus::Corrupt.status_line(), "_STATUS_:DB_CORRUPT");
@@ -520,12 +530,23 @@ mod test {
     }
 
     #[test]
+    fn downgrade_failed_line_omits_the_payload_when_there_is_no_snapshot() {
+        // The recovery screen keys its restore rung off the payload's presence,
+        // so a rolled-back down-run must emit the bare event: restoring a
+        // snapshot identical to the database loops on the recommended action.
+        assert_eq!(
+            DbStatus::DowngradeFailed(None).status_line(),
+            "_STATUS_:DB_DOWNGRADE_FAILED"
+        );
+    }
+
+    #[test]
     fn downgrade_failed_line_carries_a_windows_path_verbatim() {
         // The snapshot payload can contain a drive-letter colon; Electron parses
         // it by stripping the `_STATUS_:` prefix, so the path travels intact.
         let path = "C:\\Users\\gd\\gdl_conf.pre-downgrade.db";
         assert_eq!(
-            DbStatus::DowngradeFailed(path.to_string()).status_line(),
+            DbStatus::DowngradeFailed(Some(path.to_string())).status_line(),
             format!("_STATUS_:DB_DOWNGRADE_FAILED|{path}")
         );
     }
@@ -549,9 +570,9 @@ mod test {
         );
         assert_eq!(
             classify_open(Ok(OpenVerdict::Refuse(RefusalKind::DowngradeFailed {
-                snapshot_path: PathBuf::from("/tmp/snap.db"),
+                snapshot_path: Some(PathBuf::from("/tmp/snap.db")),
             }))),
-            Err(DbStatus::DowngradeFailed("/tmp/snap.db".to_string()))
+            Err(DbStatus::DowngradeFailed(Some("/tmp/snap.db".to_string())))
         );
         assert_eq!(
             classify_open(Err(corrupt_sqlite_error(
@@ -595,7 +616,7 @@ mod test {
         for status in [
             DbStatus::BackwardsMigration,
             DbStatus::Diverged(2),
-            DbStatus::DowngradeFailed("/tmp/s.db".to_string()),
+            DbStatus::DowngradeFailed(Some("/tmp/s.db".to_string())),
             DbStatus::Corrupt,
             DbStatus::MigrationFailed,
         ] {

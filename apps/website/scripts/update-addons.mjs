@@ -90,6 +90,22 @@ const MR_PROJECT_TYPES = {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Strip HTML tags from platform-supplied text (name/summary/title/description).
+ * Defense in depth alongside the JSON-LD script-context escaping in
+ * BaseHead.astro: a CurseForge/Modrinth project can name itself anything, so
+ * keep raw markup out of the shards themselves rather than relying solely on
+ * downstream consumers to escape it correctly.
+ */
+function stripHtml(value) {
+  if (typeof value !== "string") return value
+  // Requires a tag-start character (`<` immediately followed by `/` or a
+  // letter, or an HTML comment opener) so a bare `<` used as a comparison
+  // operator ("I <3 mods", "Java <17") isn't swallowed along with whatever
+  // follows it up to the next unrelated `>`.
+  return value.replace(/<\/?[a-zA-Z][^>]*>|<!--[\s\S]*?-->/g, "").trim()
+}
+
 // ---------------------------------------------------------------------------
 // Data extraction helpers
 // ---------------------------------------------------------------------------
@@ -176,9 +192,9 @@ function extractCurseForge(p) {
 
   return {
     id: p.id,
-    name: p.name,
+    name: stripHtml(p.name),
     slug: p.slug,
-    description: p.summary || null,
+    description: p.summary ? stripHtml(p.summary) : null,
     imageUrl: p.logo?.url || p.logo?.thumbnailUrl || null,
     websiteUrl: p.links.websiteUrl,
     sourceUrl: p.links.sourceUrl || null,
@@ -204,9 +220,9 @@ function extractModrinthSearch(hit, urlType) {
   const segment = urlType || hit.project_type
   return {
     id: hit.project_id,
-    name: hit.title,
+    name: stripHtml(hit.title),
     slug: hit.slug,
-    description: hit.description || null,
+    description: hit.description ? stripHtml(hit.description) : null,
     imageUrl: hit.icon_url,
     websiteUrl: `https://modrinth.com/${segment}/${hit.slug}`,
     sourceUrl: null,
@@ -228,9 +244,9 @@ function extractModrinthProject(p, urlType) {
   const segment = urlType || p.project_type
   return {
     id: p.id,
-    name: p.title,
+    name: stripHtml(p.title),
     slug: p.slug,
-    description: p.description || null,
+    description: p.description ? stripHtml(p.description) : null,
     imageUrl: p.icon_url,
     websiteUrl: p.source_url
       ? p.source_url

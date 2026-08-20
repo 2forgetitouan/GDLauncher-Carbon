@@ -298,16 +298,19 @@ impl InstanceImporter for CurseforgeArchiveImporter {
             None => InstanceVersionSource::Version(version),
         };
 
-        // Try to get icon from CurseForge metadata first, then fall back to GDL icon
+        // Try to get icon from CurseForge metadata first, then fall back to
+        // GDL icon — the icon is decorative and its URL is whatever the pack
+        // was published with, so a rotted link (`try_download_icon` yields
+        // `None`) falls back to the packaged icon rather than costing the
+        // user the whole import.
         let icon = match &instance.meta {
             Some(CfMetadata {
                 image_url: Some(image_url),
                 ..
-            }) => Some(
-                app.instance_manager()
-                    .download_icon(image_url.clone())
-                    .await?,
-            ),
+            }) => match app.instance_manager().try_download_icon(image_url).await {
+                Some(icon) => Some(icon),
+                None => instance.gdl_icon.clone(),
+            },
             _ => instance.gdl_icon.clone(),
         };
 

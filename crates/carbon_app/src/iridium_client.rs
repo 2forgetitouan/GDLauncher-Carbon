@@ -1,3 +1,31 @@
+/// Builds the shared client's transport config. Split out so tests can
+/// inject sub-second `connect`/`read` durations against a local server
+/// instead of waiting on the real multi-second production budgets.
+fn shared_client_builder(
+    connect: std::time::Duration,
+    read: std::time::Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(format!(
+            "{} {}",
+            env!("USER_AGENT_PREFIX"),
+            env!("APP_VERSION")
+        ))
+        .connect_timeout(connect)
+        // Bounds the gap between reads, not the whole transfer: a stalled
+        // connection dies fast while a slow, still-moving large body
+        // survives. Server-side downloads (server packs and mrpacks in
+        // server/modpack.rs, modloader installer jars in
+        // server/modloader_install.rs) stream multi-hundred-MB bodies
+        // straight through this client, so the budget must tolerate
+        // transfers that take minutes as long as bytes keep arriving.
+        // Vanilla server.jar bytes do not go through this client -- they
+        // stream through carbon_net's own downloader instead, and
+        // server/jars.rs only uses this client for two small JSON metadata
+        // GETs (the version manifest and version details).
+        .read_timeout(read)
+}
+
 pub fn get_client(gdl_base_api: String) -> reqwest_middleware::ClientBuilder {
     use reqwest::{Request, Response};
     use reqwest_middleware::{Middleware, Next};
@@ -51,7 +79,24 @@ pub fn get_client(gdl_base_api: String) -> reqwest_middleware::ClientBuilder {
                     return result;
                 }
 
-                let delay = std::time::Duration::from_millis(500u64 << attempt);
+                // A 429 that names its window is obeyed rather than guessed at:
+                // both platforms limit per minute, so the plain backoff below
+                // retries inside the same window and is refused again.
+                let declared_wait = match &result {
+                    Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        rate_limit_wait(response.headers())
+                    }
+                    _ => None,
+                };
+                if declared_wait.is_some_and(|wait| wait > MAX_HONOURED_RATE_LIMIT_WAIT) {
+                    tracing::warn!(
+                        "rate limited by {} for longer than we will wait; returning the response",
+                        req.url()
+                    );
+                    return result;
+                }
+                let delay = declared_wait
+                    .unwrap_or_else(|| std::time::Duration::from_millis(500u64 << attempt));
                 match &result {
                     Ok(response) => tracing::warn!(
                         "transient {} from {}, retrying in {:?}",
@@ -142,14 +187,12 @@ pub fn get_client(gdl_base_api: String) -> reqwest_middleware::ClientBuilder {
         }
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!(
-            "{} {}",
-            env!("USER_AGENT_PREFIX"),
-            env!("APP_VERSION")
-        ))
-        .build()
-        .expect("Failed to build HTTP client");
+    let client = shared_client_builder(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
+    )
+    .build()
+    .expect("Failed to build HTTP client");
 
     let retryable_post_hosts = [
         url::Url::parse(MODRINTH_API_BASE).ok(),
@@ -233,5 +276,290 @@ mod test {
 
         assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_response_times_out() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept failed");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .expect("failed to write headers");
+            // Never write the body: the connection just sits open.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let client = super::shared_client_builder(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(500),
+        )
+        .build()
+        .expect("failed to build client");
+
+        let result = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("headers should arrive")
+            .bytes()
+            .await;
+
+        let err = result.expect_err("a stalled body must time out");
+        assert!(err.is_timeout(), "expected a timeout error, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn slow_stream_is_not_capped() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        const CHUNK: &[u8] = b"0123456789";
+        const CHUNK_COUNT: usize = 30;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept failed");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        CHUNK.len() * CHUNK_COUNT
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("failed to write headers");
+            // A chunk every 100ms for 3s: no single gap trips a 500ms read
+            // budget, even though the transfer as a whole vastly exceeds it.
+            for _ in 0..CHUNK_COUNT {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                socket
+                    .write_all(CHUNK)
+                    .await
+                    .expect("failed to write chunk");
+            }
+        });
+
+        let client = super::shared_client_builder(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(500),
+        )
+        .build()
+        .expect("failed to build client");
+
+        let body = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("headers should arrive")
+            .bytes()
+            .await
+            .expect("a slow but steady stream must not be capped by the read gap");
+
+        assert_eq!(body.len(), CHUNK.len() * CHUNK_COUNT);
+    }
+}
+
+/// How long a server-declared rate-limit window may be before the request is
+/// handed back instead of waited out. Beyond this, holding the caller is worse
+/// than surfacing the 429.
+const MAX_HONOURED_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The wait a 429 response asks for, from `Retry-After` (delta-seconds) or
+/// Modrinth's `X-Ratelimit-Reset` (seconds until the window rolls over).
+///
+/// Both platforms rate-limit on a per-minute window, so a fixed sub-second
+/// backoff lands inside the same window and is spent for nothing: the retry is
+/// refused too, the caller still ends up with a 429, and the extra traffic
+/// pushes the window further out.
+///
+/// The two headers are tried in order, and the first one that actually
+/// parses as a plain integer wins -- not just the first one present. This
+/// matters because `Retry-After` may be sent in HTTP-date form (RFC 9110),
+/// which is not parsed here: if a response carries an HTTP-date
+/// `Retry-After` alongside a numeric `X-Ratelimit-Reset`, the reset header is
+/// now the one honoured instead of the pair reading as no declared wait at
+/// all.
+///
+/// A parsed value is normally delta-seconds, but some servers reuse the same
+/// field for an absolute reset instant (Unix epoch seconds) instead. The two
+/// readings are told apart by size: `EPOCH_LIKE_THRESHOLD` (10^6 seconds,
+/// ~11.5 days) is far beyond any rate-limit window either platform actually
+/// declares, so a value that large can only be a timestamp, never a genuine
+/// relative wait -- and it's converted to a delta against the current time
+/// and clamped to `MAX_HONOURED_RATE_LIMIT_WAIT`. Values at or under that
+/// line are always taken as a relative wait exactly as before, even ones
+/// that exceed `MAX_HONOURED_RATE_LIMIT_WAIT`: that excess is handled by the
+/// caller, which gives up and surfaces the response rather than waiting.
+fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    /// Below this, a parsed header value is taken as a relative wait in
+    /// seconds, however large; at or above it, it can only be a Unix epoch
+    /// timestamp -- no real rate-limit window is anywhere close to 10^6
+    /// seconds (~11.5 days), so this can never misclassify a legitimate
+    /// relative wait as an absolute one.
+    const EPOCH_LIKE_THRESHOLD: u64 = 1_000_000;
+
+    let parsed = ["retry-after", "x-ratelimit-reset"]
+        .iter()
+        .filter_map(|name| headers.get(*name))
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .next()?;
+
+    if parsed < EPOCH_LIKE_THRESHOLD {
+        return Some(std::time::Duration::from_secs(parsed));
+    }
+
+    let now_epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delta = parsed.saturating_sub(now_epoch_secs);
+
+    Some(std::time::Duration::from_secs(
+        delta.min(MAX_HONOURED_RATE_LIMIT_WAIT.as_secs()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+    use std::time::Duration;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn reads_retry_after_seconds() {
+        assert_eq!(
+            rate_limit_wait(&headers(&[("retry-after", "12")])),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn reads_the_modrinth_reset_header() {
+        assert_eq!(
+            rate_limit_wait(&headers(&[("x-ratelimit-reset", "45")])),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn retry_after_wins_over_the_reset_header() {
+        assert_eq!(
+            rate_limit_wait(&headers(&[
+                ("x-ratelimit-reset", "45"),
+                ("retry-after", "5")
+            ])),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn absent_or_unparseable_values_read_as_no_declared_wait() {
+        assert_eq!(rate_limit_wait(&HeaderMap::new()), None);
+        // The HTTP-date form is not parsed, and nothing else is present to
+        // fall back to.
+        assert_eq!(
+            rate_limit_wait(&headers(&[(
+                "retry-after",
+                "Wed, 21 Oct 2015 07:28:00 GMT"
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn http_date_retry_after_falls_through_to_a_parseable_reset_header() {
+        // Regression: picking the first *present* header rather than the
+        // first *parseable* one used to make this pair read as no declared
+        // wait at all, even though x-ratelimit-reset is right there and
+        // perfectly usable.
+        assert_eq!(
+            rate_limit_wait(&headers(&[
+                ("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                ("x-ratelimit-reset", "45"),
+            ])),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn both_headers_garbage_reads_as_no_declared_wait() {
+        assert_eq!(
+            rate_limit_wait(&headers(&[
+                ("retry-after", "not-a-number"),
+                ("x-ratelimit-reset", "also-not-a-number"),
+            ])),
+            None
+        );
+    }
+
+    fn current_epoch_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn epoch_style_reset_yields_a_delta_from_now() {
+        // Some servers send an absolute reset instant instead of
+        // delta-seconds. A value this far above any real rate-limit window
+        // can only be a Unix timestamp, so it must convert to a sane
+        // (small, non-negative) wait rather than being handed to the caller
+        // as a multi-decade delay.
+        let reset_at = current_epoch_secs() + 5;
+        let wait = rate_limit_wait(&headers(&[("x-ratelimit-reset", &reset_at.to_string())]))
+            .expect("an epoch-style reset must still be honoured");
+
+        assert!(
+            wait <= Duration::from_secs(5),
+            "expected a delta close to 5s, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn epoch_style_reset_far_in_the_future_clamps_to_the_max_honoured_wait() {
+        let reset_at = current_epoch_secs() + 3600;
+        let wait = rate_limit_wait(&headers(&[("x-ratelimit-reset", &reset_at.to_string())]))
+            .expect("an epoch-style reset must still be honoured");
+
+        assert_eq!(wait, MAX_HONOURED_RATE_LIMIT_WAIT);
+    }
+
+    #[test]
+    fn large_relative_wait_under_the_epoch_threshold_is_not_treated_as_a_timestamp() {
+        // 600,000 seconds (~6.9 days) is a huge wait, but it is well under
+        // the 10^6-second epoch-like threshold, so it must still read as a
+        // plain relative delta -- not get reinterpreted as a Unix timestamp
+        // and collapse to a near-zero or saturated delta.
+        assert_eq!(
+            rate_limit_wait(&headers(&[("retry-after", "600000")])),
+            Some(Duration::from_secs(600000))
+        );
     }
 }

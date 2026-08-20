@@ -50,6 +50,7 @@ import { useGlobalStore } from "@/components/GlobalStoreContext"
 import DetailPageLayout, {
   type DetailPageTab
 } from "@/pages/Library/shared/DetailPageLayout"
+import { useEntityGoneGuard } from "@/pages/Library/shared/useEntityGoneGuard"
 
 interface InstancePage {
   label: string | JSX.Element
@@ -387,6 +388,7 @@ const Instance = (props: { children?: any }) => {
     label: string | JSX.Element
     action: () => void
     disabled?: boolean
+    testId?: string
   }[] => [
     {
       icon: "i-hugeicons:pencil-edit-01",
@@ -426,11 +428,12 @@ const Instance = (props: { children?: any }) => {
     },
     {
       icon: "i-hugeicons:refresh",
-      label: t("instances:_trn_instance_settings.reinstall"),
+      label: t("instances:_trn_instance_settings.repair"),
       disabled: !hasModpack(),
+      testId: "instance-menu-repair",
       action: () => {
         modalsContext?.openModal(
-          { name: "confirmReinstall" },
+          { name: "repairModpack" },
           {
             id: instanceId(),
             name: routeData.instanceDetails.data?.name,
@@ -446,15 +449,26 @@ const Instance = (props: { children?: any }) => {
     }
   ]
 
-  createEffect(() => {
-    if (
-      routeData.instancesUngrouped.data &&
-      !routeData.instancesUngrouped.data?.find(
-        (instance: { id: number }) => instance.id === instanceId()
-      )
-    ) {
-      navigator.navigate("/library")
-    }
+  // Leaves the page when the instance this route points at is gone — deleted
+  // from under the user, most often from another surface. See
+  // `useEntityGoneGuard` for why both the NaN-id and isFetching guards
+  // matter (also used by Server/index.tsx).
+  //
+  // Neither guard has been observed firing on a real bounce here.
+  // Instrumenting this effect and every navigation to /library across three
+  // specs, including two that run against a fresh first-ever session,
+  // recorded zero NaN ids, zero navigations from here, and no case where the
+  // instance was genuinely absent; every /library navigation out of an
+  // addon route came from the download button's own `onSuccess`. So these
+  // close a window that is reachable by construction rather than one caught
+  // in the act — worth keeping at this price, but do not cite them as the
+  // cure for a bounce until something actually reproduces one.
+  useEntityGoneGuard({
+    id: instanceId,
+    list: () => routeData.instancesUngrouped.data,
+    isFetching: () => routeData.instancesUngrouped.isFetching,
+    matches: (instance: { id: number }, id) => instance.id === id,
+    redirectTo: "/library"
   })
 
   const iconUrl = () =>
@@ -627,6 +641,7 @@ const Instance = (props: { children?: any }) => {
                 <DropdownMenuTrigger class="b-0 bg-transparent p-0">
                   <Button
                     as="div"
+                    data-testid="instance-menu-trigger"
                     rounded
                     class="h-full w-full"
                     size="small"
@@ -644,6 +659,7 @@ const Instance = (props: { children?: any }) => {
               <For each={menuItems()}>
                 {(item) => (
                   <DropdownMenuItem
+                    data-testid={item.testId}
                     onSelect={item.action}
                     disabled={item.disabled}
                   >
@@ -742,12 +758,7 @@ const Instance = (props: { children?: any }) => {
       noPaddingPaths={["/addons", "/logs"]}
       isFullScreen={isFullScreen}
     >
-      <Show
-        when={
-          duplicatedMods().length > 0 &&
-          !routeData.instanceDetails.data?.modpack?.locked
-        }
-      >
+      <Show when={duplicatedMods().length > 0}>
         <div
           class="mb-4 flex items-center justify-between rounded-xl border border-yellow-600/30 bg-yellow-900/20 p-4"
           classList={{
@@ -761,26 +772,60 @@ const Instance = (props: { children?: any }) => {
                 <Trans key="content:_trn_duplicated_mods_detected" />
               </h3>
               <p class="m-0 text-sm text-yellow-300/70">
-                <Trans key="content:_trn_duplicated_mods_message" />
+                <Trans
+                  key={
+                    (() => {
+                      const isLocked = !!routeData.instanceDetails.data?.modpack
+                        ?.locked
+                      return isLocked
+                        ? "content:_trn_duplicated_mods_locked_message"
+                        : "content:_trn_duplicated_mods_message"
+                    })()
+                  }
+                />
               </p>
             </div>
           </div>
-          <Button
-            type="primary"
-            size="small"
-            onClick={() => {
-              modalsContext?.openModal(
-                { name: "duplicatedModsResolution" },
-                {
-                  duplicatedMods: duplicatedMods().map((g) => g.mods),
-                  instanceId: instanceId()
-                }
-              )
-            }}
+          <Show
+            when={!routeData.instanceDetails.data?.modpack?.locked}
+            fallback={
+              <Button
+                type="primary"
+                size="small"
+                data-testid="duplicated-mods-repair-cta"
+                onClick={() => {
+                  modalsContext?.openModal(
+                    { name: "repairModpack" },
+                    {
+                      id: instanceId(),
+                      name: routeData.instanceDetails.data?.name,
+                      isServer: false
+                    }
+                  )
+                }}
+              >
+                <div class="i-hugeicons:refresh" />
+                <Trans key="instances:_trn_instance_settings.repair" />
+              </Button>
+            }
           >
-            <div class="i-hugeicons:magic-wand-01" />
-            <Trans key="instances:_trn_fix_now" />
-          </Button>
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => {
+                modalsContext?.openModal(
+                  { name: "duplicatedModsResolution" },
+                  {
+                    duplicatedMods: duplicatedMods().map((g) => g.mods),
+                    instanceId: instanceId()
+                  }
+                )
+              }}
+            >
+              <div class="i-hugeicons:magic-wand-01" />
+              <Trans key="instances:_trn_fix_now" />
+            </Button>
+          </Show>
         </div>
       </Show>
       {props.children}

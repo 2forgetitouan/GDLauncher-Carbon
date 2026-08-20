@@ -51,6 +51,17 @@ export interface SearchResultItem {
   platform?: "curseforge" | "modrinth"
 }
 
+/** Addon types a server variant allows: mods only when a modloader is
+ *  installed, datapacks always — servers never expose shaders or resource
+ *  packs. Pulled out of `allowedAddonTypes`'s server branch below so
+ *  `useServerAddonMutations`'s `gotoSearchPage` can derive its default tab
+ *  from the same rule instead of hardcoding a second copy of it. */
+export function serverAllowedAddonTypes(
+  hasModloader: boolean
+): FEUnifiedSearchType[] {
+  return hasModloader ? ["mod", "datapack"] : ["datapack"]
+}
+
 export const getSearchResults = (_opts?: SearchResultsOpts) => {
   const rspcContext = rspc.useContext()
 
@@ -673,18 +684,16 @@ export const getSearchResults = (_opts?: SearchResultsOpts) => {
 
   // Which addon types make sense for whatever the search is adding to.
   //
-  // Servers only ever consume mods and datapacks — `listServerAddons` scans
-  // exactly those two directories, and every install path writes into `mods/`,
-  // so offering shaders or resource packs here would drop them into the
-  // server's mods folder. Modpacks are excluded for instances and servers
+  // Servers only ever consume mods and datapacks — those are the only two
+  // directories `listServerAddons` scans, and the only two an install can
+  // target, so offering shaders or resource packs here would drop them into
+  // the server's mods folder. Modpacks are excluded for instances and servers
   // alike: picking one from an "add addons" browse creates a whole new
   // instance/server rather than adding anything to the current one.
   const allowedAddonTypes = createMemo<FEUnifiedSearchType[]>(() => {
     if (selectedServerId()) {
       // A server with no modloader can still run datapacks, but not mods.
-      return selectedServer.data?.modloaderType
-        ? ["mod", "datapack"]
-        : ["datapack"]
+      return serverAllowedAddonTypes(!!selectedServer.data?.modloaderType)
     }
 
     if (selectedInstanceId()) {

@@ -1,0 +1,462 @@
+import fs from "node:fs"
+import path from "node:path"
+import { expect, test } from "./fixtures/index.js"
+import { attachCoreLogOnFailure } from "./fixtures/electronApp.js"
+import { byTestId, TEST_IDS } from "./helpers/selectors.js"
+import {
+  deleteInstanceViaUi,
+  ensureLibraryInteractive
+} from "./helpers/instances.js"
+import { readInstanceConfig } from "./helpers/instanceConfig.js"
+import { readInstanceByName } from "./helpers/versionCache.js"
+import { readPackinfo } from "./helpers/packinfo.js"
+import { readInstallAudit } from "./helpers/installAudit.js"
+import { snapshotTree } from "./helpers/instanceTree.js"
+import {
+  changeModpackVersion,
+  fetchMrpackIndex,
+  installModpackVersion,
+  openInstanceSettings,
+  packPaths,
+  unlockModpack,
+  unpairModpack,
+  type PackIndex
+} from "./helpers/modpacks.js"
+import {
+  MODPACK_MR_QUERY,
+  MODPACK_MR_SLUG,
+  MODPACK_MR_V_MID,
+  MODPACK_MR_V_NEW
+} from "./helpers/modpackFixtures.js"
+import {
+  installAddonVersion,
+  openAddonPage,
+  openAddonVersions,
+  openInstanceAddons,
+  searchForMod,
+  type InstalledMod
+} from "./helpers/mods.js"
+import { verifyModInstalled } from "./helpers/modVerify.js"
+
+/**
+ * Covers the one part of the modpack lifecycle none of the other three
+ * modpack spec files touch: the `locked` flag itself — a fresh install
+ * starts locked, unlocking flips it and unblocks Addons, and unpairing drops
+ * the association (and the flag with it) entirely.
+ *
+ * **One shared install, four serial tests.** `beforeAll` installs
+ * `MODPACK_MR_V_MID` once; `test.describe.configure({ mode: "serial" })`
+ * makes the four tests run in file order on that one instance, since test 2
+ * unlocks it and tests 3-4 depend on that already having happened. `page`/
+ * `harness` come from the worker-scoped `authenticatedApp` fixture, which
+ * `beforeAll` can use directly — it is a worker fixture, so (unlike the
+ * built-in, test-scoped `page`) it is visible there, the same way every
+ * other worker fixture in this suite (`installedInstance`, `forgeInstance`)
+ * is composed in `fixtures/index.ts`.
+ *
+ * **Unlock is one-way.** `Settings/index.tsx` renders only a `Set: false`
+ * button gated on `modpack.locked`; the re-lock call
+ * (`openModal("unlock_confirmation", ...)`) is commented out in source and
+ * nothing else in the shipped UI sets the flag back to `true`. So this file
+ * asserts what it can reach — locked, then unlocked — and never attempts a
+ * re-lock.
+ *
+ * **`unlockModpack`/`unpairModpack` leave the page on the instance's
+ * Settings tab**, not `/library` (`helpers/modpacks.ts`'s own doc comments
+ * on both). `afterEach` below returns to `/library` via the navbar logo
+ * before asserting the library is interactive, the same pattern
+ * `modpackInstall.spec.ts`/`modpackSaveGuard.spec.ts` use — this is what
+ * keeps that navigation from being every test body's own problem.
+ *
+ * **Fabric API collision, found live while writing test 2:
+ * `installModIntoInstance` (the addon page's header button, "install
+ * latest") cannot be used for `P7dR8mSH` against this pack.** "remarkably"
+ * bundles its own copy of Fabric API (`fabric-api-0.92.6+1.20.1.jar`, per
+ * `modpackLifecycle.spec.ts`'s own `KNOWN_STALE_SURVIVORS_AFTER_DOWNGRADE`
+ * list), and every mod file's Modrinth project association — however it
+ * arrived on disk — is resolved automatically (confirmed live, a throwaway
+ * probe: `openInstanceAddons` right after install already reports
+ * `modrinthProjectId: "P7dR8mSH"` for the pack's own bundled copy). Reading
+ * `ModDownloadButton`'s `isInstalled()` (`components/ModDownloadButton/index.tsx`)
+ * confirms why that matters: with no `fileId` (the header button's "install
+ * latest" path), it returns `!!installedMod()` — true the instant *any* mod
+ * with a matching project id exists, independent of which specific build.
+ * So the header button already reads "Downloaded" before this file ever
+ * clicks it, and `installModIntoInstance`'s own "not already Downloaded"
+ * precondition would fail immediately. The fix: install a *specific,
+ * different* Fabric API build through the addon page's Versions tab
+ * (`openAddonVersions` + `installAddonVersion`, explicitly excluding the
+ * pack's own bundled version id) — `isInstalled()` for a set `fileId`
+ * compares `modrinth!.version_id` instead, so a genuinely different build
+ * correctly reads as not-yet-installed. `modLifecycle.spec.ts`'s own update
+ * test already proves this exact mechanism against this exact mod
+ * (Fabric API) on a plain instance, so this is a proven path, not a new one.
+ *
+ * **Why test 3 also hand-edits a pack config.** The Fabric API build
+ * installed in test 2 is never a packinfo key, so nothing in
+ * `process_modpack_staging` (`run/modpack.rs`) may ever consider it: loop
+ * 1 walks `packinfo.files`, loop 2 (`modpack.rs:808-823`, the staging-walk
+ * mutation's target) walks `staging_dir`, which `process_modpack`
+ * (`modpack.rs:336`)
+ * creates *empty* and fills only from the pack's own declared manifest. A
+ * path that is in neither input is unreachable by a mutation confined to
+ * either loop, by construction — which is exactly test 3's whole point, but
+ * it also means the staging-walk mutation (dropping its
+ * `!original_file.exists()` guard) has no way to touch it: dropping a guard
+ * inside a loop that never iterates this path cannot make an assertion
+ * about this path go red. Confirmed independently by `modpackLifecycle.spec.ts`'s
+ * own structurally equivalent sabotage
+ * (`modpack.rs:815`, there swapped for a packinfo-membership check), which
+ * went red on a *pack-tracked, user-deleted* file and nothing else — never on
+ * that file's synthetic, wholly-untracked
+ * `userMod`/`userSave`. So this test adds one pristine pack config, edited
+ * by hand before the version change (the same mechanism
+ * `modpackLifecycle.spec.ts`'s own `editTarget` uses, at far smaller scale —
+ * one file, no real launch to partition pristine-vs-already-modified first,
+ * since this file's instance is never actually launched, so every packinfo
+ * entry is still pristine by construction). `ModifiedByUser` leaves that
+ * file's staged replacement behind, unconsumed, in `staging_dir`
+ * (`modpack.rs:776-783` `continue`s before the rename at :802) — exactly
+ * what a dropped guard at :815 would then overwrite. This is what that
+ * mutation actually goes red on here; see the test's own comment.
+ *
+ * **The packinfo-gap comparison in test 3** asserts `missingFromPackinfo`
+ * against an empty array directly, the same as `modpackLifecycle.spec.ts`'s
+ * own assertion. `packinfo::scan_dir` rebuilds `packinfo.json` purely by
+ * hashing whatever physically landed in `staging_dir`, and
+ * `prepare_modpack_from_mrpack` skips re-downloading (and thus re-staging) a
+ * file whose new-version sha512 already matches what the old packinfo
+ * recorded — so a pack file unchanged between `MODPACK_MR_V_MID` and
+ * `MODPACK_MR_V_NEW` would otherwise end up silently absent from the
+ * rebuilt `packinfo.json`, independent of anything a test does.
+ * `process_modpack`'s snapshot block merges the skip-oracle's hash back
+ * into packinfo for every such path (the same merge fix
+ * `modpackLifecycle.spec.ts`'s own doc comment documents in depth), so
+ * packinfo is complete after a version change and there is no gap to
+ * predict.
+ *
+ * **The unlock-button mutation needs no such workaround.**
+ * `Settings/index.tsx`'s unlock
+ * button's mutation is a direct, literal `Set: false` — changing it to
+ * `Set: true` is exactly what test 2's `locked).toBe(false)` assertion
+ * exists to catch.
+ *
+ * **This file is why `InfiniteScrollVersionsQueryWrapper`'s scoping effect
+ * got fixed.** Running it hit 9 consecutive identical failures —
+ * `scrollVersionRowIntoView`'s "may have been replaced by a re-render", same
+ * version id, same call site — because that effect wiped and refetched the
+ * whole row set on every pass, including passes where the resolved scope had
+ * not changed at all. Confirmed to be the product and not this file by
+ * re-running the already-green `modpackSaveGuard.spec.ts` against the
+ * identical `installModpackVersion(MODPACK_MR_QUERY, "modrinth",
+ * MODPACK_MR_V_MID)` call: same failure, same line, same session. Not a
+ * live-service issue either — a full `page.on("response")` log over the whole
+ * install showed zero non-2xx Modrinth responses, and the one console
+ * "Failed to load resource: 500" traces to the app's unrelated YouTube embed.
+ * The query is now gated on that scope and only tears the list down when the
+ * scope really moves, so `installModpackVersion` asserts its way to the row
+ * instead of retrying towards it, and this file calls it directly.
+ *
+ * **A second pre-existing gap, in `unlockModpack`/`unpairModpack` this time,
+ * also worked around locally.** `Settings/index.tsx`'s `updateInstanceMutation`
+ * carries an `onMutate` handler that optimistically writes the mutation's
+ * effect straight into the `instanceDetails` query cache — for
+ * `modpackLocked: { Set: <bool> }` (unlock) or `{ Set: null }` (unpair) alike
+ * (lines 56-63) — client-side, before the real rspc round trip (and the disk
+ * write it drives, `update_instance`/`managers/instance/mod.rs`) ever
+ * completes. That is what actually makes the unlock button unmount /
+ * the modpack block disappear, so `unlockModpack`'s and `unpairModpack`'s own
+ * `toHaveCount(0)` waits (`helpers/modpacks.ts`) are satisfied by the
+ * optimistic update alone and prove nothing about disk. Structurally the
+ * same class of gap `helpers/mods.ts`'s `toggleModEnabled`/`deleteModViaUi`
+ * already document and guard against for the analogous mod-enable toggle
+ * (`optimisticToggleAddon` runs synchronously ahead of `mutateAsync` there
+ * too) — neither modpack helper has an equivalent "await the real response"
+ * guard. Confirmed live, this task: a bare `readInstanceConfig` read
+ * immediately after `unlockModpack` returned observed `locked: true` — the
+ * pre-unlock value — twice across three runs. Tests 2 and 4 below poll the
+ * disk read instead of reading it once, the same defensive shape this suite
+ * already uses everywhere a UI signal races a backend effect (`expect.poll`),
+ * rather than trusting either helper's return as proof of anything on disk.
+ */
+test.describe("modpack lock, unlock and unpair", () => {
+  test.describe.configure({ mode: "serial" })
+
+  let name: string
+  let root: string
+  let midIndex: PackIndex
+  let installedUserMod: InstalledMod
+
+  test.beforeAll(async ({ authenticatedApp }) => {
+    const { page, harness } = authenticatedApp
+    name = await installModpackVersion(
+      page,
+      MODPACK_MR_QUERY,
+      "modrinth",
+      MODPACK_MR_V_MID
+    )
+    const { shortpath } = readInstanceByName(harness.runtimePath, name)
+    root = path.join(harness.runtimePath, "instances", shortpath)
+    midIndex = await fetchMrpackIndex(MODPACK_MR_V_MID)
+  })
+
+  test.afterAll(async ({ authenticatedApp }) => {
+    // Best-effort: this only tidies the shared library for whatever spec
+    // file runs next in this worker (CI pins `workers: 1`, so every spec
+    // file in a full run shares one app instance and runtime path). A
+    // cleanup failure here must never be allowed to override or obscure
+    // whatever the four tests above already reported.
+    if (!name) return
+    try {
+      await authenticatedApp.page
+        .locator(byTestId(TEST_IDS.navbarLogo))
+        .click({ timeout: 5_000 })
+      await deleteInstanceViaUi(authenticatedApp.page, name)
+    } catch (cleanupError) {
+      console.error(`cleanup: deleting "${name}" also failed:`, cleanupError)
+    }
+  })
+
+  test.afterEach(async ({ authenticatedApp }, testInfo) => {
+    await attachCoreLogOnFailure(testInfo, authenticatedApp.harness.runtimePath)
+    await authenticatedApp.page
+      .locator(byTestId(TEST_IDS.navbarLogo))
+      .click({ timeout: 5_000 })
+      .catch(() => {})
+    await ensureLibraryInteractive(authenticatedApp.page)
+  })
+
+  test("a freshly installed modpack is locked", async ({
+    authenticatedApp
+  }) => {
+    const { page } = authenticatedApp
+
+    const config = await readInstanceConfig(root)
+    expect(
+      config.modpack?.locked,
+      "a freshly installed modpack instance must be locked"
+    ).toBe(true)
+
+    // `Tabs/Addons/index.tsx:68-69` derives `isInstanceLocked()` from
+    // `instanceDetails.data?.modpack?.locked` and passes it down at :180 as
+    // `addButtonDisabled`, with a `_trn_locked_cannot_apply_changes` tooltip.
+    // `addonsAddButton` anchors the button that receives it
+    // (`AddonFilters.tsx`, a real `@gd/ui` `Button` that spreads `disabled`
+    // onto its native element, not a class-based fake).
+    await openInstanceAddons(page, name)
+    await expect(
+      page.locator(byTestId(TEST_IDS.addonsAddButton)),
+      "a locked modpack instance still allowed addons to be added"
+    ).toBeDisabled()
+  })
+
+  test("unlocking lets a mod be installed", async ({ authenticatedApp }) => {
+    const { page } = authenticatedApp
+
+    await unlockModpack(page, name)
+    // Polled, not a single read — see the module doc comment on
+    // `updateInstanceMutation`'s optimistic cache update: `unlockModpack`'s
+    // own `toHaveCount(0)` wait (`helpers/modpacks.ts`) is satisfied by that
+    // optimistic update, which lands client-side before the real rspc round
+    // trip — and the disk write it drives (`update_instance`,
+    // `managers/instance/mod.rs`) — actually completes. Confirmed live this
+    // task: a bare read immediately after `unlockModpack` returned observed
+    // `locked: true` twice across three runs.
+    await expect
+      .poll(async () => (await readInstanceConfig(root)).modpack?.locked, {
+        message: "unlockModpack did not flip locked to false on disk"
+      })
+      .toBe(false)
+
+    // `unlockModpack` leaves the page on the instance's Settings tab (see
+    // the module doc comment) — `addonsAddButton` only exists on the Addons
+    // tab, so this must navigate there before it can assert anything about
+    // that button. See the module doc comment for why the pack's own
+    // bundled Fabric API makes the header "install latest" button unusable
+    // here: a specific, different build via the Versions tab is what
+    // actually exercises "unlocking lets a mod be installed".
+    const modsBeforeInstall = await openInstanceAddons(page, name)
+    await expect(
+      page.locator(byTestId(TEST_IDS.addonsAddButton)),
+      "the Add Addons button stayed disabled after unlocking"
+    ).toBeEnabled()
+    const bundled = modsBeforeInstall.find(
+      (m) => m.modrinthProjectId === "P7dR8mSH"
+    )
+
+    await searchForMod(page, { platform: "modrinth", query: "fabric api" })
+    await openAddonPage(page, "P7dR8mSH")
+
+    const versions = await openAddonVersions(page)
+    const target = versions
+      .filter((v) => v.fileId !== bundled?.modrinthVersionId)
+      .sort(
+        (a, b) => Date.parse(b.datePublished) - Date.parse(a.datePublished)
+      )[0]
+    expect(
+      target,
+      "no Fabric API build is available other than the one the pack itself " +
+        `bundles (version id ${bundled?.modrinthVersionId}) — re-check the ` +
+        "project's Versions tab"
+    ).toBeDefined()
+    await installAddonVersion(page, target)
+
+    const mods = await openInstanceAddons(page, name)
+    installedUserMod = mods.find(
+      (m) =>
+        m.modrinthProjectId === "P7dR8mSH" &&
+        m.modrinthVersionId === target.fileId
+    )!
+    expect(
+      installedUserMod,
+      "Fabric API did not install into the unlocked instance"
+    ).toBeDefined()
+    expect(
+      await verifyModInstalled(path.join(root, "instance", "mods"), {
+        filename: installedUserMod.filename
+      })
+    ).toMatchObject({ ok: true })
+  })
+
+  test("a user's own mod survives a modpack version change", async ({
+    authenticatedApp
+  }) => {
+    const { page } = authenticatedApp
+    const data = path.join(root, "instance")
+    const next = await fetchMrpackIndex(MODPACK_MR_V_NEW)
+
+    // See the module doc comment: gives the staging-walk mutation a genuinely
+    // reachable
+    // target, since the Fabric API mod below structurally cannot be one.
+    // No real launch ever happens in this file, so every packinfo entry is
+    // still pristine at this point — no `classifyPackinfo` partition needed,
+    // unlike `modpackLifecycle.spec.ts`. Picked from `/config/` overrides
+    // still declared by NEW: overrides are unconditionally re-extracted on
+    // every version change regardless of content (`modrinth.rs:321-379`),
+    // so a still-declared one is guaranteed a fresh staged copy for this
+    // transition — a `/mods/` entry would not do, since a pack mod skips
+    // re-staging entirely when its bytes are unchanged (the same mechanism
+    // behind the packinfo gap below), leaving nothing in `staging_dir` for
+    // the guard to matter against.
+    const packinfoBefore = await readPackinfo(root)
+    const nextOverridePaths = new Set(next.overrides)
+    const editKey = [...packinfoBefore.keys()].find(
+      (k) => k.startsWith("/config/") && nextOverridePaths.has(k.slice(1))
+    )
+    expect(
+      editKey,
+      `no pack config in "${MODPACK_MR_SLUG}" both lives under /config/ and ` +
+        "survives into the new version — re-check the pack's own overrides"
+    ).toBeDefined()
+    const editedRelPath = editKey!.slice(1)
+    const editedBody = `e2e-modpack-lock-edited-${Date.now()}\n`
+    await fs.promises.writeFile(path.join(data, editedRelPath), editedBody)
+
+    const before = await snapshotTree(data)
+
+    await changeModpackVersion(page, name, MODPACK_MR_V_NEW)
+
+    const after = await snapshotTree(data)
+    const rel = `mods/${installedUserMod.filename}`
+    expect(
+      after.get(rel)?.sha256,
+      "a version change deleted or rewrote a mod the user installed themselves"
+    ).toBe(before.get(rel)?.sha256)
+
+    const audit = await readInstallAudit(root)
+    expect(audit, "the version change wrote no install audit").not.toBeNull()
+    expect(audit!.deleted, `audit claims it deleted ${rel}`).not.toContain(
+      `/${rel}`
+    )
+    expect(audit!.replaced, `audit claims it replaced ${rel}`).not.toContain(
+      `/${rel}`
+    )
+    // `created` carries the same leading-slash, packinfo-style spelling as
+    // `deleted`/`replaced` above (`render_audit` writes one path format into
+    // every section) — compared the same way, by prefixing `/` onto `rel`,
+    // not by normalising the array.
+    expect(audit!.created, `audit claims it created ${rel}`).not.toContain(
+      `/${rel}`
+    )
+    expect(
+      audit!.skipped.map((s) => s.file),
+      `audit claims it skipped ${rel}`
+    ).not.toContain(`/${rel}`)
+
+    // The hand-edited config also survives, byte-identical, reported
+    // modified-by-user. This is the assertion that mutation actually goes red
+    // on — see the module doc comment.
+    expect(
+      await fs.promises.readFile(path.join(data, editedRelPath), "utf8"),
+      "the version change overwrote a user-edited pack config"
+    ).toBe(editedBody)
+    const editSkip = audit!.skipped.find((s) => s.file === editKey)
+    expect(
+      editSkip?.reason,
+      `audit reason for the edited config ${editKey}`
+    ).toBe("modified-by-user")
+
+    // And the pack itself still updated correctly around both of them.
+    // `process_modpack`'s snapshot block merges the skip-oracle's hash back
+    // into packinfo for every path unchanged since MID (the same merge fix
+    // `modpackLifecycle.spec.ts`'s doc comment documents in depth), so
+    // packinfo is complete after the version change — see this file's
+    // module doc comment's "packinfo-gap comparison" paragraph for why no
+    // gap is expected here.
+    const packinfoAfter = await readPackinfo(root)
+    const packinfoPathsAfter = new Set(
+      [...packinfoAfter.keys()].map((k) => k.slice(1))
+    )
+    const nextPathSet = new Set(packPaths(next))
+    const missingFromPackinfo = packPaths(next)
+      .filter((p) => !packinfoPathsAfter.has(p))
+      .sort()
+    expect(
+      missingFromPackinfo,
+      "packinfo.json is missing pack files after the version change"
+    ).toEqual([])
+    expect(
+      [...packinfoPathsAfter].filter((p) => !nextPathSet.has(p)),
+      "packinfo.json records a path the new version does not declare"
+    ).toEqual([])
+    // `readPackinfo` returns a Map, so `.has` is the correct probe — see the
+    // module doc comment for why `toHaveProperty` here would be vacuous.
+    expect(
+      packinfoAfter.has(`/${rel}`),
+      "packinfo.json tracks a mod the user installed themselves"
+    ).toBe(false)
+  })
+
+  test("unpairing removes the modpack association entirely", async ({
+    authenticatedApp
+  }) => {
+    const { page } = authenticatedApp
+
+    await unpairModpack(page, name)
+
+    // Polled for the same reason test 2 polls its disk read: `unpairModpack`
+    // sends `modpackLocked: { Set: null }`, which the same optimistic
+    // `onMutate` handler in `Settings/index.tsx` (lines 56-63) also covers —
+    // `variables.modpackLocked.Set === null` clears the cached `modpack`
+    // client-side before the real round trip (and disk write) completes, so
+    // `unpairModpack`'s own `toHaveCount(0)` wait proves nothing about disk
+    // here either.
+    await expect
+      .poll(async () => (await readInstanceConfig(root)).modpack, {
+        message: "unpair left a modpack on the instance"
+      })
+      // `parseModpack` (`helpers/instanceConfig.ts`) maps an absent/null
+      // `modpack` key to `null`, never `undefined` — `v1::Instance.modpack`
+      // is `Option<ModpackInfo>` and the raw JSON key can be entirely
+      // absent, but either way the parsed result here is `null`.
+      .toBeNull()
+
+    await openInstanceSettings(page, name)
+    await expect(
+      page.locator(byTestId(TEST_IDS.instanceSettingsChangeVersion))
+    ).toHaveCount(0)
+    await expect(
+      page.locator(byTestId(TEST_IDS.instanceSettingsUnpair))
+    ).toHaveCount(0)
+  })
+})

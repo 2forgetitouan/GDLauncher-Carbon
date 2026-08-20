@@ -1,4 +1,4 @@
-//! Bidirectional runner simulation tests (spec §9, CI matrix T10/T11).
+//! Bidirectional runner simulation tests.
 //!
 //! The runner takes the migration list as a parameter, so an "old binary" is
 //! simulated by passing the real 25-migration list and a "new binary" by
@@ -38,7 +38,7 @@ const ADD_WIDGET: MigrationDef = MigrationDef {
 
 /// Breaking migration 27: rebuilds `Widget` to drop the `label` column (the
 /// classic table-rebuild). Its down restores `Widget` from the exact prior DDL,
-/// as a generated down does (spec §10.1: recreate from the before-snapshot),
+/// as a generated down does (recreate from the before-snapshot),
 /// so the down-run result is byte-identical to replaying the ups to version 26.
 const DROP_WIDGET_LABEL: MigrationDef = MigrationDef {
     name: "27_drop_widget_label",
@@ -239,6 +239,48 @@ fn breaking_ahead_down_runs_and_restores_byte_identical_schema() {
 }
 
 #[test]
+fn a_rolled_back_down_run_offers_no_snapshot() {
+    // The down-run is atomic, so every failure path leaves the database exactly
+    // as it was. A snapshot of it is then byte-identical to it, and the recovery
+    // screen offers restoring one as the Recommended action — which changes
+    // nothing, fails identically, and funnels the user to Reset Database, the
+    // rung that deletes both the database and the snapshot.
+    let (_d, path) = temp_db();
+    let bad_down = MigrationDef {
+        name: "27_bad_down",
+        up_sql: "CREATE TABLE Gizmo (id INTEGER PRIMARY KEY);",
+        down_sql: Some("THIS IS NOT VALID SQL;"),
+        kind: MigrationKind::Breaking,
+        data_down: "full",
+    };
+    let l26 = extend(&base(), &[bad_down]);
+    let l25 = base();
+
+    {
+        let mut conn = open_db(&path);
+        l26.to_latest(&mut conn).unwrap();
+    }
+
+    let mut conn = open_db(&path);
+    let verdict = l25.open(&mut conn, &path).unwrap();
+    match verdict {
+        OpenVerdict::Refuse(RefusalKind::DowngradeFailed { snapshot_path }) => {
+            assert!(
+                snapshot_path.is_none(),
+                "a rollback leaves nothing to restore, got {snapshot_path:?}"
+            );
+        }
+        other => panic!("expected DowngradeFailed, got {other:?}"),
+    }
+
+    let stray = path.with_extension("pre-downgrade.db");
+    assert!(
+        !stray.exists(),
+        "a snapshot identical to the database must not be left behind"
+    );
+}
+
+#[test]
 fn corrupt_down_rolls_back_and_leaves_the_database_intact() {
     // CENSUS-SELFTEST: compat.downgrade-corrupt-down
     let (_d, path) = temp_db();
@@ -263,7 +305,9 @@ fn corrupt_down_rolls_back_and_leaves_the_database_intact() {
         let verdict = l25.open(&mut conn, &path).unwrap();
         match verdict {
             OpenVerdict::Refuse(RefusalKind::DowngradeFailed { snapshot_path }) => {
-                assert!(snapshot_path.exists(), "snapshot preserved on failure");
+                // The rollback below leaves the database as it was, so there is
+                // nothing a restore could change.
+                assert!(snapshot_path.is_none());
             }
             other => panic!("expected DowngradeFailed, got {other:?}"),
         }
@@ -403,10 +447,9 @@ fn breaking_ahead_without_a_stored_down_is_refused_and_snapshot_kept() {
         let verdict = l25.open(&mut conn, &path).unwrap();
         match verdict {
             OpenVerdict::Refuse(RefusalKind::DowngradeFailed { snapshot_path }) => {
-                assert!(
-                    snapshot_path.exists(),
-                    "snapshot preserved when no down exists"
-                );
+                // Refused before any statement ran, so the database is
+                // untouched and a restore would be a no-op.
+                assert!(snapshot_path.is_none());
             }
             other => {
                 panic!("expected DowngradeFailed for a down-less breaking migration, got {other:?}")
@@ -424,6 +467,66 @@ fn breaking_ahead_without_a_stored_down_is_refused_and_snapshot_kept() {
             .unwrap();
         assert_eq!(ahead, 1, "the ahead metadata row must remain after refusal");
     }
+}
+
+#[test]
+fn down_run_refuses_a_snapshot_when_the_wal_checkpoint_stays_busy() {
+    // CENSUS-SELFTEST: compat.downgrade-checkpoint-busy
+    // `wal_checkpoint(TRUNCATE)` only reports busy when a live reader's
+    // pinned snapshot sits BEHIND newly committed frames — a reader already
+    // caught up to the latest commit does not block it. So the write that
+    // produces the frames to protect must happen strictly after the reader's
+    // snapshot is pinned, not before. down_run must fail loud instead of
+    // copying a main file that may not yet hold those committed frames.
+    let (_d, path) = temp_db();
+    let l25 = base();
+    let l26 = extend(&base(), &[BREAKING_AT_26]);
+
+    let mut conn = open_db(&path);
+    // The production open path always runs in WAL mode (db_bootstrap.rs sets
+    // it before calling `open`); a checkpoint only has anything to contend
+    // over once the database actually is in WAL mode.
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    l25.to_latest(&mut conn).unwrap();
+    assert_eq!(user_version(&conn), 25);
+
+    // Pin the reader's snapshot at version 25, before version 26 is written.
+    let reader = open_db(&path);
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM _migrations;")
+        .unwrap();
+
+    // Committed after the reader's snapshot was pinned: these frames are
+    // exactly what a checkpoint now cannot safely fold in and truncate past.
+    l26.to_latest(&mut conn).unwrap();
+    assert_eq!(user_version(&conn), 26);
+
+    // A fresh connection, as `down_run` itself uses to snapshot.
+    let mut down_conn = open_db(&path);
+    let result = l25.open(&mut down_conn, &path);
+    assert!(
+        result.is_err(),
+        "a busy checkpoint must refuse the down-run rather than snapshot silently, got {result:?}"
+    );
+
+    // The failure happens before the file copy step, so no snapshot — complete
+    // or partial — is left behind for this attempt.
+    let snapshot = path.with_file_name("gdl_conf.pre-downgrade.db");
+    assert!(
+        !snapshot.exists(),
+        "a refused checkpoint must not leave a snapshot behind"
+    );
+
+    reader.execute_batch("COMMIT;").unwrap();
+
+    // Once the reader releases its snapshot, the checkpoint can complete and
+    // the down-run proceeds normally.
+    let mut retry_conn = open_db(&path);
+    assert_eq!(
+        l25.open(&mut retry_conn, &path).unwrap(),
+        OpenVerdict::Downgraded
+    );
+    assert_eq!(user_version(&retry_conn), 25);
 }
 
 #[test]
@@ -449,4 +552,131 @@ fn breaking_only_range_down_runs_from_intermediate_version() {
     assert_eq!(l26.open(&mut conn, &path).unwrap(), OpenVerdict::Downgraded);
     assert_eq!(user_version(&conn), 26);
     assert_eq!(dump_schema(&conn).unwrap(), reference_26);
+}
+
+#[test]
+fn stale_migrations_row_above_user_version_self_heals_on_reapply() {
+    // Simulates a file-level restore (e.g. a Time Machine / VSS snapshot of
+    // just the main database file, out of sync with its `-wal`) that rolls
+    // `user_version` back to N-1 while leaving the schema and the
+    // `_migrations` row for N exactly as they were — a state a plain `INSERT`
+    // in `apply_pending` cannot re-apply into: it would hit the existing row's
+    // `version` primary key and fail, rolling back an otherwise perfectly
+    // applicable (idempotent) migration and turning this self-healable state
+    // into a fatal migration failure.
+    const IDEMPOTENT_WIDGET: MigrationDef = MigrationDef {
+        name: "26_idempotent_widget",
+        up_sql: "CREATE TABLE IF NOT EXISTS Widget (id INTEGER PRIMARY KEY);",
+        down_sql: Some("DROP TABLE Widget;"),
+        kind: MigrationKind::Additive,
+        data_down: "full",
+    };
+    let (_d, path) = temp_db();
+    let l26 = extend(&base(), &[IDEMPOTENT_WIDGET]);
+
+    let mut conn = open_db(&path);
+    l26.to_latest(&mut conn).unwrap();
+    assert_eq!(user_version(&conn), 26);
+    assert!(table_exists(&conn, "Widget"));
+
+    // The restore: only the version counter regresses. The schema and the
+    // now-stale `_migrations` row for 26 are left untouched, exactly as a
+    // partial file-level restore would leave them.
+    conn.pragma_update(None, "user_version", 25).unwrap();
+
+    // Re-running the migration set must self-heal: version 26's up re-applies
+    // as a no-op (`IF NOT EXISTS`) and its metadata row is replaced, not
+    // rejected as a primary-key conflict.
+    l26.to_latest(&mut conn).unwrap();
+    assert_eq!(user_version(&conn), 26);
+
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _migrations WHERE version = 26",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the stale row must be replaced, not duplicated");
+}
+
+/// Breaking migration 26, self-contained so a down-run covers exactly one
+/// version. Marked breaking because the kind is what forces the down-run path
+/// rather than an overlay.
+const BREAKING_AT_26: MigrationDef = MigrationDef {
+    name: "26_add_gadget",
+    up_sql: "CREATE TABLE Gadget (id INTEGER PRIMARY KEY);",
+    down_sql: Some("DROP TABLE Gadget;"),
+    kind: MigrationKind::Breaking,
+    data_down: "full",
+};
+
+/// A torn file-level restore (a VSS or Time Machine copy of the main file out
+/// of sync with its `-wal`) can leave `_migrations` rows for versions the
+/// restored schema never received. Such a row must not be down-run: that
+/// migration's forward half never touched this database.
+///
+/// The planted down here is the dangerous shape — hand-written DML (the
+/// `--dml-reviewed` class the tooling supports) that rewrites data without
+/// altering the schema. A pure-DDL down would usually fail against a schema it
+/// never modified and roll the whole attempt back, but this one succeeds, the
+/// schema still matches the reference, and the transaction commits: the
+/// corruption reaches the user reported as a successful downgrade.
+#[test]
+fn stale_migration_rows_above_user_version_are_not_down_run() {
+    let (_d, path) = temp_db();
+    let l25 = base();
+    let l26 = extend(&base(), &[BREAKING_AT_26]);
+
+    let reference = {
+        let mut c = open_db(&path.with_extension("ref.db"));
+        l25.to_latest(&mut c).unwrap();
+        dump_schema(&c).unwrap()
+    };
+
+    {
+        let mut conn = open_db(&path);
+        l26.to_latest(&mut conn).unwrap();
+        assert_eq!(user_version(&conn), 26);
+
+        conn.execute_batch(
+            "INSERT INTO AppConfiguration (releaseChannel, xmx) VALUES ('stable', 4096);",
+        )
+        .unwrap();
+
+        // The stale row: recorded, but its up never ran here. Its down halves
+        // the configured heap — the inverse of a doubling this database never
+        // received.
+        conn.execute(
+            "INSERT INTO _migrations \
+             (version, name, checksum, kind, down_sql, data_down, applied_at) \
+             VALUES (27, '27_scale_xmx', 'deadbeef', 'breaking', ?1, 'full', 0)",
+            ["UPDATE AppConfiguration SET xmx = xmx / 2;"],
+        )
+        .unwrap();
+    }
+
+    {
+        let mut conn = open_db(&path);
+        let verdict = l25.open(&mut conn, &path).unwrap();
+        assert_eq!(
+            verdict,
+            OpenVerdict::Downgraded,
+            "the genuinely applied migration 26 still steps back"
+        );
+        assert_eq!(user_version(&conn), 25);
+        assert_eq!(
+            dump_schema(&conn).unwrap(),
+            reference,
+            "schema is byte-identical to own 25"
+        );
+
+        let xmx: i64 = conn
+            .query_row("SELECT xmx FROM AppConfiguration", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            xmx, 4096,
+            "the stale row's down must not have run; it would have halved this"
+        );
+    }
 }

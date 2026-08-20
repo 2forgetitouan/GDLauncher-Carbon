@@ -8,14 +8,18 @@ use crate::domain::server::{
     ServerState, ServerType,
 };
 use crate::domain::vtask::VisualTaskId;
+use crate::managers::minecraft::modrinth::secure_path_join;
+use crate::managers::orphan_pid;
 use anyhow::{Context, anyhow, bail};
 use carbon_repos::dbtypes::DbDateTime;
 use carbon_repos::repos::mod_file_cache as mfcdb;
 use carbon_repos::repos::server::{self as server_repo, IndexShift, ServerPatch};
+use carbon_rt_path::ServerPath;
 use chrono::Utc;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tracing::{error, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
@@ -30,6 +34,125 @@ pub mod provider;
 
 const MAX_PATH: usize = if cfg!(windows) { 260 } else { 4096 };
 const ILLEGAL_CHARS: &[char] = &['/', ':', '\\', '<', '>', '*', '|', '"', '?', '^'];
+
+/// Auto-restart tuning for a server that keeps crashing right after boot (bad
+/// heap args, a corrupted world, etc). Both the per-attempt delay and the
+/// total attempt count are bounded, so a server that crashes instantly can
+/// never spin the JVM in a tight loop: the delay doubles per consecutive fast
+/// crash up to a ceiling, and auto-restart gives up entirely past a cap.
+const CRASH_RESTART_BASE_DELAY_SECS: u64 = 3;
+const CRASH_RESTART_MAX_DELAY_SECS: u64 = 5 * 60;
+const CRASH_RESTART_MAX_ATTEMPTS: u32 = 6;
+/// A run lasting at least this long is treated as healthy: a later crash
+/// starts a fresh attempt count instead of continuing the backoff.
+const CRASH_RESTART_HEALTHY_UPTIME_SECS: i64 = 60;
+
+/// Backoff delay before auto-restarting a crashed server, doubling per
+/// consecutive fast crash and capped so it can never grow unbounded (the
+/// exponent is clamped before the shift, so this never overflows).
+fn crash_restart_delay(attempts: u32) -> std::time::Duration {
+    let exponent = attempts.saturating_sub(1).min(10);
+    let backoff_secs = CRASH_RESTART_BASE_DELAY_SECS.saturating_mul(1u64 << exponent);
+    std::time::Duration::from_secs(backoff_secs.min(CRASH_RESTART_MAX_DELAY_SECS))
+}
+
+/// Strips control characters (notably newlines) from a single-line console
+/// command, so an operator-supplied field embedded in one — a ban reason, an
+/// IP — can't smuggle in extra newline-separated console commands.
+fn sanitize_console_command(command: &str) -> String {
+    command.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Picks the directory an installed addon belongs in.
+///
+/// A server reads `.jar` mods from `mods/` and `.zip` datapacks from
+/// `world/datapacks/`, and `cache_server_local` scans for exactly those two
+/// extensions in those two directories — a `.jar` under `datapacks/` or a
+/// `.zip` under `mods/` is both dead to the server and invisible to that scan,
+/// so it can't be listed or removed from the UI.
+///
+/// That scan is what makes the extension the whole decision here. The
+/// platform's project type can't improve on it: a datapack project's
+/// loader-packaged `.jar` version is a mod and belongs in `mods/`, and routing
+/// any `.zip` anywhere but `datapacks/` would hide it. Deciding by type
+/// instead would only be safe if the scanner inspected file contents too, which
+/// it doesn't.
+fn server_addon_dir(server_path: &ServerPath, filename: &str) -> std::path::PathBuf {
+    let is_zip = std::path::Path::new(filename)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if is_zip {
+        server_path.get_datapacks_path()
+    } else {
+        server_path.get_mods_path()
+    }
+}
+
+/// Narrows a CurseForge file search by the server's modloader, but only when
+/// the project is a mod.
+///
+/// A datapack is published without loader tags, so filtering its files by a
+/// loader matches none of them and the search reports the addon as having no
+/// version compatible with the server.
+fn curseforge_modloader_filter(
+    class_id: Option<&carbon_platforms::curseforge::ClassId>,
+    server_modloader: Option<&str>,
+) -> Option<carbon_platforms::curseforge::ModLoaderType> {
+    use carbon_platforms::curseforge::{ClassId, ModLoaderType};
+
+    if !matches!(class_id, Some(ClassId::Mods) | None) {
+        return None;
+    }
+
+    match server_modloader? {
+        "forge" => Some(ModLoaderType::Forge),
+        "fabric" => Some(ModLoaderType::Fabric),
+        "quilt" => Some(ModLoaderType::Quilt),
+        "neoforge" => Some(ModLoaderType::NeoForge),
+        _ => None,
+    }
+}
+
+/// The Modrinth half of [`curseforge_modloader_filter`]. A datapack's versions
+/// are tagged `datapack` rather than with a loader, so a loader-filtered
+/// version query returns an empty list.
+fn modrinth_loader_filter(
+    project_type: &carbon_platforms::modrinth::project::ProjectType,
+    server_modloader: Option<&str>,
+) -> Option<Vec<String>> {
+    use carbon_platforms::modrinth::project::ProjectType;
+
+    if *project_type != ProjectType::Mod {
+        return None;
+    }
+
+    server_modloader.map(|loader| vec![loader.to_string()])
+}
+
+/// Resolves the server port, defaulting when unset, and rejects a value outside
+/// the valid TCP range so an out-of-range port fails here with a clear message
+/// rather than as an opaque JVM bind error at launch.
+fn resolve_server_port(port: Option<i32>) -> anyhow::Result<i32> {
+    let port = port.unwrap_or(25565);
+    if !(1..=65535).contains(&port) {
+        bail!("Server port must be between 1 and 65535, got {port}");
+    }
+    Ok(port)
+}
+
+/// Validates a `server-port` value from a `server.properties` patch against
+/// the same range `resolve_server_port` enforces, so a bad value is rejected
+/// before any DB/file write instead of surfacing later as an opaque JVM bind
+/// error.
+fn validate_server_port_patch(value: &str) -> anyhow::Result<i32> {
+    let parsed: i32 = value
+        .parse()
+        .map_err(|_| anyhow!("Server port must be a number, got `{value}`"))?;
+    if !(1..=65535).contains(&parsed) {
+        bail!("Server port must be between 1 and 65535, got {parsed}");
+    }
+    Ok(parsed)
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("Minecraft server EULA has not been accepted for server {server_id}")]
@@ -85,6 +208,13 @@ pub struct ServerManager {
     server_logs: RwLock<HashMap<ServerLogId, watch::Sender<Vec<String>>>>,
     log_counter: Mutex<i32>,
     index_lock: Mutex<()>,
+    /// Consecutive fast-crash count per server, used to back off and cap
+    /// automatic restarts. See `crash_restart_delay`.
+    crash_restart_state: DashMap<ServerId, u32>,
+    /// Servers whose auto-restart has hit `CRASH_RESTART_MAX_ATTEMPTS` and
+    /// given up. Surfaced to the frontend as `auto_restart_abandoned`;
+    /// cleared the moment the server is started manually.
+    crash_restart_abandoned: DashMap<ServerId, ()>,
 }
 
 impl std::fmt::Debug for ServerManager {
@@ -107,11 +237,125 @@ impl ServerManager {
             server_logs: RwLock::new(HashMap::new()),
             log_counter: Mutex::new(0),
             index_lock: Mutex::new(()),
+            crash_restart_state: DashMap::new(),
+            crash_restart_abandoned: DashMap::new(),
         }
+    }
+
+    /// Whether `id`'s auto-restart has given up after repeated fast crashes
+    /// without a healthy run. Cleared the moment the server is next started
+    /// manually — see `ManagerRef<ServerManager>::start_server`.
+    pub fn is_auto_restart_abandoned(&self, id: ServerId) -> bool {
+        self.crash_restart_abandoned.contains_key(&id)
+    }
+
+    /// Records a crash for `id` and returns the updated consecutive
+    /// fast-crash count plus whether auto-restart has now given up. A prior
+    /// run lasting at least `CRASH_RESTART_HEALTHY_UPTIME_SECS` (`healthy`)
+    /// resets the streak instead of continuing it. Hitting
+    /// `CRASH_RESTART_MAX_ATTEMPTS` marks the server abandoned.
+    fn record_crash_restart_attempt(&self, id: ServerId, healthy: bool) -> (u32, bool) {
+        let attempts = {
+            let mut entry = self.crash_restart_state.entry(id).or_insert(0);
+            if healthy {
+                *entry = 0;
+            }
+            *entry += 1;
+            *entry
+        };
+
+        let abandoned = attempts > CRASH_RESTART_MAX_ATTEMPTS;
+        if abandoned {
+            self.crash_restart_abandoned.insert(id, ());
+        }
+        (attempts, abandoned)
     }
 
     fn get_provider(&self) -> Box<dyn ServerProvider> {
         Box::new(LocalServerProvider)
+    }
+
+    /// Best-effort graceful shutdown of every currently running (or
+    /// starting) server, meant for the core process itself being terminated
+    /// (SIGTERM/SIGINT/Ctrl+C) so servers get a `kill` signal instead of
+    /// being silently orphaned. Bounded to `SHUTDOWN_TIMEOUT` for the whole
+    /// operation — including a stalled kill — so a caller awaiting this can
+    /// never hang past that; a timeout here is only logged; it does not
+    /// change what the caller does next (main.rs exits the process either
+    /// way, relying on `.kill_on_drop(true)` and the pidfile-based cleanup
+    /// on next launch as the fallback for whatever didn't get killed).
+    pub async fn shutdown_running(&self) {
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let outcome = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            let provider = self.get_provider();
+            let servers = self.servers.read().await;
+
+            let kills = servers.iter().filter_map(|(id, data)| {
+                let is_live = matches!(
+                    data.state,
+                    ServerState::Running { .. } | ServerState::Starting(_)
+                );
+                match (is_live, &data.handle) {
+                    (true, Some(handle)) => Some((*id, handle)),
+                    _ => None,
+                }
+            });
+
+            futures::future::join_all(kills.map(|(id, handle)| {
+                let provider = &provider;
+                async move {
+                    if let Err(e) = provider.kill(handle).await {
+                        warn!(
+                            "Failed to signal shutdown to server {} (pid {}): {}",
+                            id.0, handle.process_id, e
+                        );
+                    }
+                }
+            }))
+            .await;
+        })
+        .await;
+
+        if outcome.is_err() {
+            warn!(
+                "shutdown_running did not finish within {:?}; proceeding with core exit anyway",
+                SHUTDOWN_TIMEOUT
+            );
+        }
+    }
+
+    /// Waits until the server's process handle has been cleared or `timeout`
+    /// elapses. `stop_server_locked` clears the handle from its background task
+    /// only once the JVM has actually exited (force-killing it after its own
+    /// graceful budget), so a caller about to touch the server's files on disk
+    /// uses this to avoid `remove_dir_all`ing a directory the JVM still holds
+    /// open. Returns early the moment the handle is gone; the timeout is only a
+    /// backstop so a stuck process can't wedge the caller forever.
+    async fn wait_for_process_exit(&self, id: ServerId, timeout: std::time::Duration) {
+        let start = std::time::Instant::now();
+
+        loop {
+            {
+                let servers = self.servers.read().await;
+                match servers.get(&id) {
+                    Some(server) if server.handle.is_some() => {}
+                    // Handle cleared (process exited) or the server is gone.
+                    _ => return,
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                warn!(
+                    "Server {} did not exit within {}s; proceeding without waiting",
+                    id.0,
+                    timeout.as_secs()
+                );
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -137,6 +381,13 @@ impl ManagerRef<'_, ServerManager> {
     async fn load_servers(self) -> anyhow::Result<()> {
         let db_servers = server_repo::get_all_servers(&self.app.db).await?;
 
+        // Before any server is registered in memory as Stopped, reconcile
+        // its pidfile against the live process table: a JVM from a session
+        // the core didn't shut down cleanly (crash, force-quit, Windows
+        // TerminateProcess) is otherwise invisible here and keeps holding
+        // its port forever.
+        self.clean_up_orphaned_servers(&db_servers).await;
+
         let mut servers = self.servers.write().await;
         for db_server in db_servers {
             servers.insert(
@@ -151,6 +402,97 @@ impl ManagerRef<'_, ServerManager> {
         }
 
         Ok(())
+    }
+
+    /// Reconcile every server's on-disk pidfile against the live process
+    /// table, killing any pid that is still alive AND still looks like a
+    /// java process (an orphaned JVM this core recorded but never cleaned
+    /// up), and otherwise just discarding a stale/reused pid. Entirely
+    /// best-effort: every failure is logged and swallowed so this can never
+    /// fail or delay startup.
+    async fn clean_up_orphaned_servers(self, db_servers: &[server_repo::ServerRow]) {
+        let runtime_path = &self.app.settings_manager().runtime_path;
+        let servers_path = runtime_path.get_servers();
+
+        // Pass 1: read every server's pidfile (best-effort, one small file
+        // read each) and collect the recorded pids up front, so the process
+        // table only needs a single targeted refresh for this whole pass
+        // instead of a full system scan per server.
+        let mut recorded: Vec<(i32, std::path::PathBuf, Option<(u32, Option<u64>)>)> =
+            Vec::with_capacity(db_servers.len());
+        for db_server in db_servers {
+            let root = servers_path
+                .get_server_path(&db_server.shortpath)
+                .get_root();
+            let pid = match provider::read_pid_file(&root).await {
+                Ok(pid) => pid,
+                Err(e) => {
+                    warn!(
+                        "Failed to read pidfile for server {} at {}: {}",
+                        db_server.id,
+                        root.display(),
+                        e
+                    );
+                    None
+                }
+            };
+            recorded.push((db_server.id, root, pid));
+        }
+
+        let pids: Vec<Pid> = recorded
+            .iter()
+            .filter_map(|(_, _, pid)| pid.map(|(p, _)| Pid::from_u32(p)))
+            .collect();
+
+        let mut system = System::new();
+        if !pids.is_empty() {
+            system.refresh_processes(ProcessesToUpdate::Some(&pids));
+        }
+
+        // Pass 2: reconcile. Every server with a recorded pid gets its
+        // pidfile removed one way or another; only a pid sysinfo confirms is
+        // still alive, still java, AND whose start time matches what was
+        // recorded when this launcher spawned it is killed first — a legacy
+        // pidfile or a start-time mismatch means its identity can't be
+        // proven, and is refused exactly like a dead or reused pid.
+        for (server_id, root, pid) in recorded {
+            let live = pid.and_then(|(p, _)| orphan_pid::live_proc(&system, p));
+
+            match orphan_pid::reconcile_pid(pid, live) {
+                orphan_pid::PidReconcileAction::NoPidFile => {}
+                orphan_pid::PidReconcileAction::RemoveStale => {
+                    provider::remove_pid_file(&root).await;
+                }
+                orphan_pid::PidReconcileAction::NotOurs => {
+                    // Safe: NotOurs is only ever produced from `Some(pid)`.
+                    let (pid, _) = pid.expect("NotOurs implies a recorded pid");
+                    warn!(
+                        "Server {} has a recorded pid ({}) that cannot be proven to still be its own JVM (legacy pidfile or start-time mismatch) — refusing to kill it",
+                        server_id, pid
+                    );
+                    provider::remove_pid_file(&root).await;
+                }
+                orphan_pid::PidReconcileAction::StillRunning => {
+                    // A server is launcher-hosted infrastructure and does not
+                    // outlive the launcher, so a live one here is an orphan to
+                    // clean up — the opposite of `InstanceManager`, which
+                    // adopts the game it finds.
+                    //
+                    // Safe: StillRunning is only ever produced from `Some(pid)`.
+                    let (pid, _) = pid.expect("StillRunning implies a recorded pid");
+                    warn!(
+                        "Server {} has an orphaned java process (pid {}) still running from a previous session — killing it",
+                        server_id, pid
+                    );
+                    if let Some(process) = system.process(Pid::from_u32(pid)) {
+                        if !process.kill() {
+                            warn!("Failed to signal orphaned server process (pid {})", pid);
+                        }
+                    }
+                    provider::remove_pid_file(&root).await;
+                }
+            }
+        }
     }
 
     fn get_op_lock(self, id: ServerId) -> Arc<Mutex<()>> {
@@ -258,7 +600,7 @@ impl ManagerRef<'_, ServerManager> {
             bail!("Server name cannot be empty");
         }
 
-        let port = port.unwrap_or(25565);
+        let port = resolve_server_port(port)?;
 
         // Generate shortpath from name
         let shortpath = generate_shortpath(&name);
@@ -496,7 +838,7 @@ impl ManagerRef<'_, ServerManager> {
             bail!("Server name cannot be empty");
         }
 
-        let port = port.unwrap_or(25565);
+        let port = resolve_server_port(port)?;
         let shortpath = generate_shortpath(&name);
         let runtime_path = &self.app.settings_manager().runtime_path;
         let servers_path = runtime_path.get_servers();
@@ -612,25 +954,19 @@ impl ManagerRef<'_, ServerManager> {
             },
         );
 
-        // Download and save the modpack icon before spawning (small thumbnail, won't block)
+        // Download and save the modpack icon before spawning (small thumbnail, won't block).
+        // Reuse the instance downloader so the caller-supplied URL is scheme-checked
+        // and the body is size-capped.
         if let Some(ref url) = icon_url {
-            match self.app.reqwest_client.get(url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        if let Ok(bytes) = response.bytes().await {
-                            let icon_path = server_path.get_root().join("icon.png");
-                            if let Err(e) = tokio::fs::write(&icon_path, &bytes).await {
-                                warn!("Failed to write server icon: {}", e);
-                            } else {
-                                let sid = server_id.0;
-                                let _ = server_repo::set_server_icon_revision(
-                                    &self.app.db,
-                                    sid,
-                                    Some(1),
-                                )
-                                .await;
-                            }
-                        }
+            match self.app.instance_manager().download_icon(url.clone()).await {
+                Ok((_, bytes)) => {
+                    let icon_path = server_path.get_root().join("icon.png");
+                    if let Err(e) = tokio::fs::write(&icon_path, &bytes).await {
+                        warn!("Failed to write server icon: {}", e);
+                    } else {
+                        let sid = server_id.0;
+                        let _ =
+                            server_repo::set_server_icon_revision(&self.app.db, sid, Some(1)).await;
                     }
                 }
                 Err(e) => {
@@ -990,15 +1326,51 @@ impl ManagerRef<'_, ServerManager> {
         let lock = self.get_op_lock(id);
         let _guard = lock.lock().await;
 
+        // Block on states where deleting now would race a background writer.
+        // `Running` is handled below (stop it, then proceed) rather than
+        // rejected here. `Deleting` is deliberately NOT rejected: it only
+        // shows up on a server whose own earlier `delete_server` call already
+        // deleted the DB row before failing (e.g. mid-`remove_dir_all`), and
+        // rejecting it here would turn that failure into a permanently stuck
+        // state instead of one the caller can retry by calling delete again.
+        {
+            let servers = self.servers.read().await;
+            let server = servers
+                .get(&id)
+                .ok_or_else(|| anyhow!("Server not found"))?;
+            match &server.state {
+                ServerState::Stopped { .. }
+                | ServerState::Running { .. }
+                | ServerState::Deleting => {}
+                ServerState::Installing(_) => {
+                    bail!("Cannot delete a server while it is installing");
+                }
+                ServerState::Starting(_) => {
+                    bail!("Cannot delete a server while it is starting");
+                }
+                ServerState::Stopping => {
+                    bail!("Server is stopping — wait for it to fully stop before deleting");
+                }
+            }
+        }
+
         // Stop if running
         {
             let servers = self.servers.read().await;
             if let Some(server) = servers.get(&id) {
                 if matches!(server.state, ServerState::Running { .. }) {
                     drop(servers);
-                    self.stop_server(id).await?;
-                    // Wait a moment for graceful shutdown
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Already holding this server's op-lock, so the unlocked
+                    // body must be called directly — going through
+                    // `stop_server` would re-lock the same non-reentrant
+                    // per-id `Mutex` and deadlock.
+                    self.stop_server_locked(id).await?;
+                    // The JVM holds the server directory's files open. Wait for
+                    // it to actually exit before deleting on disk, rather than
+                    // guessing with a fixed sleep — `stop_server_locked`
+                    // force-kills after ~35s, so wait a little past that.
+                    self.wait_for_process_exit(id, std::time::Duration::from_secs(45))
+                        .await;
                 }
             }
         }
@@ -1014,8 +1386,9 @@ impl ManagerRef<'_, ServerManager> {
         self.app.invalidate(GET_ALL_SERVERS, None);
         self.app.invalidate(GET_SERVER_DETAILS, None);
 
-        // Delete from DB
-        server_repo::delete_server(&self.app.db, id.0).await?;
+        // Delete from DB, together with the server's cached mod rows: the
+        // cascade only clears those while foreign keys are enforced.
+        server_repo::delete_server_tx(&self.app.db, id.0).await?;
 
         // Delete files
         let shortpath = {
@@ -1034,9 +1407,15 @@ impl ManagerRef<'_, ServerManager> {
             }
         }
 
-        // Remove from memory
-        self.servers.write().await.remove(&id);
+        // Remove from memory, including the server's log-broadcast channel
+        // (keyed by its last log id) so it isn't leaked for the session.
+        let removed = self.servers.write().await.remove(&id);
+        if let Some(log_id) = removed.and_then(|server| server.last_log_id) {
+            self.server_logs.write().await.remove(&log_id);
+        }
         self.server_op_locks.remove(&id);
+        self.crash_restart_state.remove(&id);
+        self.crash_restart_abandoned.remove(&id);
 
         self.app.invalidate(GET_ALL_SERVERS, None);
         self.app.invalidate(GET_GROUPS, None);
@@ -1044,7 +1423,19 @@ impl ManagerRef<'_, ServerManager> {
         Ok(())
     }
 
+    /// Starts `id` manually. Always gets a fresh auto-restart cycle: past
+    /// crash history — including a prior "gave up" state — no longer applies
+    /// once the user has taken over, fulfilling the give-up log's "until it
+    /// is started manually" promise. The auto-restart watcher's own retries
+    /// call `start_server_impl` directly so a retry doesn't erase the streak
+    /// it's the one accumulating.
     pub async fn start_server(self, id: ServerId) -> anyhow::Result<()> {
+        self.crash_restart_state.remove(&id);
+        self.crash_restart_abandoned.remove(&id);
+        self.start_server_impl(id).await
+    }
+
+    async fn start_server_impl(self, id: ServerId) -> anyhow::Result<()> {
         let lock = self.get_op_lock(id);
         let _guard = lock.lock().await;
 
@@ -1153,8 +1544,14 @@ impl ManagerRef<'_, ServerManager> {
             }
         });
 
-        // Load modloader launch config
-        let launch_config = modloader_launch::get_launch_config(&server_path).await?;
+        // Load modloader launch config, re-deriving a stale one that names
+        // nothing to launch from what is actually installed.
+        let launch_config = modloader_launch::resolve_launch_config(
+            &server_path,
+            db_server.modloader_type.as_deref(),
+            db_server.modloader_version.as_deref(),
+        )
+        .await?;
 
         // Start server via provider
         let provider = self.get_provider();
@@ -1166,13 +1563,14 @@ impl ManagerRef<'_, ServerManager> {
                 db_server.xms,
                 &db_server.extra_java_args,
                 &launch_config,
+                db_server.modloader_type.as_deref(),
                 log_tx,
             )
             .await?;
 
         let process_id = handle.process_id;
 
-        let exit_notify = handle.exit_notify.clone();
+        let mut exited = handle.exited.clone();
 
         // Update state
         {
@@ -1207,60 +1605,96 @@ impl ManagerRef<'_, ServerManager> {
         self.app.invalidate(GET_SERVER_DETAILS, None);
 
         // Spawn a watcher for unexpected exits (crash/normal exit not triggered by stop/kill).
-        // If auto_restart is enabled, restart the server automatically.
+        // If auto_restart is enabled, restart the server automatically with a capped,
+        // backing-off retry so a server that crashes instantly cannot tight-loop.
         let app = self.app.clone();
         tokio::spawn(async move {
-            exit_notify.notified().await;
+            exited.wait().await;
 
             // Check if the exit was unexpected (state is still Running).
             // If stop_server/kill_server initiated the shutdown, they will have
             // already transitioned the state away from Running.
-            let should_restart = {
+            let (should_restart, uptime) = {
                 let mut servers = app.server_manager.servers.write().await;
                 let Some(server) = servers.get_mut(&id) else {
                     return;
                 };
-                if !matches!(server.state, ServerState::Running { .. }) {
+                let start_time = match &server.state {
+                    ServerState::Running { start_time, .. } => *start_time,
                     // stop_server or kill_server already handling cleanup
-                    return;
-                }
+                    _ => return,
+                };
                 // Unexpected exit — clean up the handle
                 server.handle = None;
                 server.state = ServerState::Stopped { failed_task: None };
 
                 // Check auto_restart setting from DB
-                server_repo::get_server(&app.db, id.0)
+                let auto_restart = server_repo::get_server(&app.db, id.0)
                     .await
                     .ok()
                     .flatten()
                     .map(|s| s.auto_restart)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+
+                (auto_restart, Utc::now() - start_time)
             };
 
             app.invalidate(GET_ALL_SERVERS, None);
             app.invalidate(GET_SERVER_DETAILS, None);
 
-            if should_restart {
-                info!("Server {} exited unexpectedly, auto-restarting", id.0);
-                // Brief delay to avoid tight crash loops
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                // ManagerRef's future is not Send, so we use a oneshot to
-                // bridge into a context where we can call start_server.
-                let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
-                let app2 = app.clone();
-                // This inner task owns the Arc and can create a ManagerRef locally
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Handle::current();
-                    let result = rt.block_on(app2.server_manager().start_server(id));
-                    let _ = tx.send(result);
-                });
-                match rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!("Failed to auto-restart server {}: {}", id.0, e),
-                    Err(_) => error!("Auto-restart channel dropped for server {}", id.0),
-                }
-            } else {
+            if !should_restart {
                 warn!("Server {} exited unexpectedly", id.0);
+                return;
+            }
+
+            // A run lasting at least CRASH_RESTART_HEALTHY_UPTIME_SECS resets the
+            // attempt count — this crash starts a fresh sequence rather than
+            // continuing a tight loop.
+            let healthy = uptime >= chrono::Duration::seconds(CRASH_RESTART_HEALTHY_UPTIME_SECS);
+            let (attempts, abandoned) =
+                app.server_manager.record_crash_restart_attempt(id, healthy);
+
+            if abandoned {
+                error!(
+                    "Server {} crashed {} times in a row without staying up {}s; giving up on auto-restart until it is started manually",
+                    id.0,
+                    attempts - 1,
+                    CRASH_RESTART_HEALTHY_UPTIME_SECS
+                );
+                // Surfaces `auto_restart_abandoned` to the frontend now,
+                // rather than waiting for the next unrelated invalidation.
+                app.invalidate(GET_ALL_SERVERS, None);
+                app.invalidate(GET_SERVER_DETAILS, None);
+                return;
+            }
+
+            let delay = crash_restart_delay(attempts);
+            info!(
+                "Server {} exited unexpectedly, auto-restarting in {:?} (attempt {}/{})",
+                id.0, delay, attempts, CRASH_RESTART_MAX_ATTEMPTS
+            );
+            tokio::time::sleep(delay).await;
+            // ManagerRef's future is not Send, so we use a oneshot to
+            // bridge into a context where we can call start_server_impl.
+            let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+            let app2 = app.clone();
+            // Captured here, on a runtime thread: the handle lives in a
+            // thread-local that a freshly spawned OS thread does not inherit,
+            // so resolving it inside the closure below would panic instead.
+            let rt = tokio::runtime::Handle::current();
+            // This inner task owns the Arc and can create a ManagerRef locally.
+            // Calls `start_server_impl` directly (bypassing the public
+            // `start_server`'s crash-state reset) — this retry is the one
+            // accumulating the streak `record_crash_restart_attempt` tracks,
+            // so it must not erase it on every attempt.
+            std::thread::spawn(move || {
+                let result = rt.block_on(app2.server_manager().start_server_impl(id));
+                let _ = tx.send(result);
+            });
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Failed to auto-restart server {}: {}", id.0, e),
+                Err(_) => error!("Auto-restart channel dropped for server {}", id.0),
             }
         });
 
@@ -1272,9 +1706,18 @@ impl ManagerRef<'_, ServerManager> {
         let lock = self.get_op_lock(id);
         let _guard = lock.lock().await;
 
+        self.stop_server_locked(id).await
+    }
+
+    /// Body of `stop_server`, assuming the caller already holds `id`'s
+    /// op-lock. `delete_server` holds that same lock across its own "stop if
+    /// running" step and calls this directly — going through `stop_server`
+    /// there would re-lock the non-reentrant per-id `Mutex` the caller is
+    /// still holding and deadlock every time the server is `Running`.
+    async fn stop_server_locked(self, id: ServerId) -> anyhow::Result<()> {
         let provider = self.get_provider();
 
-        let exit_notify = {
+        let mut exited = {
             let servers = self.servers.read().await;
             let server = servers
                 .get(&id)
@@ -1283,7 +1726,7 @@ impl ManagerRef<'_, ServerManager> {
                 .handle
                 .as_ref()
                 .ok_or_else(|| anyhow!("Server is not running"))?;
-            handle.exit_notify.clone()
+            handle.exited.clone()
         };
 
         // Send stop command
@@ -1312,7 +1755,7 @@ impl ManagerRef<'_, ServerManager> {
         tokio::spawn(async move {
             const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-            match tokio::time::timeout(GRACEFUL_TIMEOUT, exit_notify.notified()).await {
+            match tokio::time::timeout(GRACEFUL_TIMEOUT, exited.wait()).await {
                 Ok(()) => {
                     info!("Server {} process exited gracefully", id.0);
                 }
@@ -1330,11 +1773,8 @@ impl ManagerRef<'_, ServerManager> {
                     }
                     drop(servers);
                     // Brief wait for the kill to complete
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        exit_notify.notified(),
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), exited.wait())
+                        .await;
                 }
             }
 
@@ -1448,6 +1888,7 @@ impl ManagerRef<'_, ServerManager> {
             xms: db_server.xms,
             extra_java_args: db_server.extra_java_args,
             auto_restart: db_server.auto_restart,
+            auto_restart_abandoned: self.is_auto_restart_abandoned(id),
             date_created: db_server.date_created.into(),
             last_started: db_server.last_started.map(|d| d.into()),
             state,
@@ -1541,16 +1982,23 @@ impl ManagerRef<'_, ServerManager> {
         let btree_updates: std::collections::BTreeMap<String, String> =
             updates.into_iter().collect();
 
+        // Reject an out-of-range `server-port` before touching the DB or the
+        // file — the same range `resolve_server_port` enforces at launch, so
+        // a bad value is rejected here rather than surfacing later as an
+        // opaque JVM bind error.
+        if let Some(port) = btree_updates.get("server-port") {
+            validate_server_port_patch(port)?;
+        }
+
         if props_path.exists() {
             let existing = tokio::fs::read_to_string(&props_path).await?;
             let updated = properties::update_properties(&existing, &btree_updates);
             tokio::fs::write(&props_path, &updated).await?;
         } else {
-            // Create new file
-            let mut content = String::from("#Minecraft server properties\n");
-            for (key, value) in &btree_updates {
-                content.push_str(&format!("{}={}\n", key, value));
-            }
+            // Create new file, routed through the same sanitizer as the
+            // update-existing-file path so a raw newline in a value can't
+            // inject an extra property line.
+            let content = properties::update_properties("", &btree_updates);
             tokio::fs::write(&props_path, &content).await?;
         }
 
@@ -1673,6 +2121,10 @@ impl ManagerRef<'_, ServerManager> {
     /// Send a console command if the server is running (best-effort)
     pub async fn send_console_if_running(self, id: ServerId, command: String) {
         if self.is_server_running(id).await {
+            // Structured console commands are single-line; an operator-supplied
+            // field (ban reason, IP) with an embedded newline would otherwise
+            // inject additional console commands.
+            let command = sanitize_console_command(&command);
             let _ = self.send_console_command(id, command).await;
         }
     }
@@ -1896,9 +2348,11 @@ impl ManagerRef<'_, ServerManager> {
             .clone()
             .ok_or_else(|| anyhow!("Mod cannot be downloaded without privileged API key"))?;
 
-        let mods_path = server_path.get_mods_path();
-        tokio::fs::create_dir_all(&mods_path).await?;
-        let install_path = mods_path.join(&file.file_name);
+        let install_dir = server_addon_dir(&server_path, &file.file_name);
+        tokio::fs::create_dir_all(&install_dir).await?;
+        // The filename comes from the platform response; confine it under the
+        // addon directory so a `..`/absolute name can't write elsewhere.
+        let install_path = secure_path_join(&install_dir, &file.file_name)?;
 
         let checksums = file
             .hashes
@@ -1954,20 +2408,28 @@ impl ManagerRef<'_, ServerManager> {
         id: ServerId,
         project_id: u32,
     ) -> anyhow::Result<VisualTaskId> {
-        use carbon_platforms::curseforge::filters::{ModFilesParameters, ModFilesParametersQuery};
+        use carbon_platforms::curseforge::filters::{
+            ModFilesParameters, ModFilesParametersQuery, ModParameters,
+        };
 
         let db_server = server_repo::get_server(&self.app.db, id.0)
             .await?
             .ok_or_else(|| anyhow!("Server not found"))?;
 
+        let project = self
+            .app
+            .modplatforms_manager()
+            .curseforge
+            .get_mod(ModParameters {
+                mod_id: project_id as i32,
+            })
+            .await?;
+
         let game_version = db_server.game_version.clone();
-        let modloader_type = db_server.modloader_type.as_deref().and_then(|ml| match ml {
-            "forge" => Some(carbon_platforms::curseforge::ModLoaderType::Forge),
-            "fabric" => Some(carbon_platforms::curseforge::ModLoaderType::Fabric),
-            "quilt" => Some(carbon_platforms::curseforge::ModLoaderType::Quilt),
-            "neoforge" => Some(carbon_platforms::curseforge::ModLoaderType::NeoForge),
-            _ => None,
-        });
+        let modloader_type = curseforge_modloader_filter(
+            project.data.class_id.as_ref(),
+            db_server.modloader_type.as_deref(),
+        );
 
         let files = self
             .app
@@ -2030,9 +2492,11 @@ impl ManagerRef<'_, ServerManager> {
             .reduce(|a, b| if b.primary { b } else { a })
             .ok_or_else(|| anyhow!("Modrinth version has no files"))?;
 
-        let mods_path = server_path.get_mods_path();
-        tokio::fs::create_dir_all(&mods_path).await?;
-        let install_path = mods_path.join(&file.filename);
+        let install_dir = server_addon_dir(&server_path, &file.filename);
+        tokio::fs::create_dir_all(&install_dir).await?;
+        // The filename comes from the platform response; confine it under the
+        // addon directory so a `..`/absolute name can't write elsewhere.
+        let install_path = secure_path_join(&install_dir, &file.filename)?;
 
         let checksum = Checksum::Sha1(file.hashes.sha1.clone());
 
@@ -2088,8 +2552,16 @@ impl ManagerRef<'_, ServerManager> {
             .await?
             .ok_or_else(|| anyhow!("Server not found"))?;
 
+        let project = self
+            .app
+            .modplatforms_manager()
+            .modrinth
+            .get_project(ProjectID(project_id.clone()))
+            .await?;
+
         let game_version = db_server.game_version.clone();
-        let loaders = db_server.modloader_type.as_ref().map(|ml| vec![ml.clone()]);
+        let loaders =
+            modrinth_loader_filter(&project.project_type, db_server.modloader_type.as_deref());
 
         let versions = self
             .app
@@ -2954,4 +3426,386 @@ fn generate_shortpath(name: &str) -> String {
         .as_millis();
 
     format!("{}_{}", base, timestamp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The auto-restart watcher bridges into `start_server` by moving a runtime
+    /// handle onto a dedicated OS thread, because the `ManagerRef` future is not
+    /// `Send`. Resolving the handle on that thread instead would panic — tokio
+    /// keeps it in a thread-local that `std::thread::spawn` does not inherit —
+    /// and the panic surfaces only as a dropped oneshot, so the restart silently
+    /// never happens.
+    #[tokio::test]
+    async fn runtime_handle_bridges_onto_a_plain_os_thread() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let rt = tokio::runtime::Handle::current();
+
+        std::thread::spawn(move || {
+            // Drives a future that needs the runtime's timer driver, the way
+            // `start_server` needs its IO driver.
+            let result = rt.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                7
+            });
+            let _ = tx.send(result);
+        });
+
+        assert_eq!(
+            rx.await.expect("bridge thread dropped the channel"),
+            7,
+            "the bridge must run the future rather than panicking"
+        );
+    }
+
+    #[test]
+    fn resolve_server_port_defaults_and_bounds() {
+        assert_eq!(resolve_server_port(None).unwrap(), 25565);
+        assert_eq!(resolve_server_port(Some(25577)).unwrap(), 25577);
+        assert_eq!(resolve_server_port(Some(1)).unwrap(), 1);
+        assert_eq!(resolve_server_port(Some(65535)).unwrap(), 65535);
+        assert!(resolve_server_port(Some(0)).is_err());
+        assert!(resolve_server_port(Some(-1)).is_err());
+        assert!(resolve_server_port(Some(65536)).is_err());
+    }
+
+    #[test]
+    fn validate_server_port_patch_rejects_out_of_range_and_non_numeric() {
+        // A `server-port` patch outside the TCP range must be rejected before
+        // `update_server_properties` ever reaches the DB/file write — not
+        // surfaced later as an opaque JVM bind error.
+        assert!(validate_server_port_patch("70000").is_err());
+        assert!(validate_server_port_patch("0").is_err());
+        assert!(validate_server_port_patch("-1").is_err());
+        assert!(validate_server_port_patch("not-a-number").is_err());
+
+        assert_eq!(validate_server_port_patch("25565").unwrap(), 25565);
+        assert_eq!(validate_server_port_patch("1").unwrap(), 1);
+        assert_eq!(validate_server_port_patch("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn sanitize_console_command_strips_control_chars() {
+        assert_eq!(
+            sanitize_console_command("ban Steve griefing"),
+            "ban Steve griefing"
+        );
+        // A newline in the ban reason must not become a second console command.
+        assert_eq!(
+            sanitize_console_command("ban Steve reason\nop attacker"),
+            "ban Steve reasonop attacker"
+        );
+        assert_eq!(
+            sanitize_console_command("ban-ip 1.2.3.4 reason\r\nop attacker"),
+            "ban-ip 1.2.3.4 reasonop attacker"
+        );
+    }
+
+    #[test]
+    fn server_addon_dir_matches_the_scan_by_extension() {
+        let server_path = ServerPath::new(std::path::PathBuf::from("servers/test"));
+
+        // `cache_server_local` scans `mods/` for `*.jar` and `datapacks/` for
+        // `*.zip`, so the destination has to match the extension or the
+        // installed file is invisible to that scan — unlistable, unremovable.
+        assert_eq!(
+            server_addon_dir(&server_path, "cool-datapack.zip"),
+            server_path.get_datapacks_path()
+        );
+        assert_eq!(
+            server_addon_dir(&server_path, "cool-mod.jar"),
+            server_path.get_mods_path()
+        );
+
+        // A datapack project's loader-packaged version is a `.jar`, so it lands
+        // in `mods/` where a loader can find it. The project's type doesn't
+        // enter into it — only what the scan will see does.
+        assert_eq!(
+            server_addon_dir(&server_path, "cool-datapack-fabric.jar"),
+            server_path.get_mods_path()
+        );
+
+        // A CurseForge/Modrinth-supplied filename's extension case is not
+        // guaranteed — an uppercase `.ZIP` must still route to `datapacks/`,
+        // matching the scan's now case-insensitive extension check.
+        assert_eq!(
+            server_addon_dir(&server_path, "Pack.ZIP"),
+            server_path.get_datapacks_path()
+        );
+        assert_eq!(
+            server_addon_dir(&server_path, "Cool-Mod.JAR"),
+            server_path.get_mods_path()
+        );
+    }
+
+    #[test]
+    fn modloader_filter_narrows_mod_searches_only() {
+        use carbon_platforms::curseforge::{ClassId, ModLoaderType};
+        use carbon_platforms::modrinth::project::ProjectType;
+
+        // A modded server narrows a mod search to its own loader.
+        assert!(matches!(
+            curseforge_modloader_filter(Some(&ClassId::Mods), Some("fabric")),
+            Some(ModLoaderType::Fabric)
+        ));
+        assert_eq!(
+            modrinth_loader_filter(&ProjectType::Mod, Some("fabric")),
+            Some(vec!["fabric".to_string()])
+        );
+
+        // A datapack carries no loader tag on either platform, so keeping the
+        // filter would match nothing and report the pack as having no version
+        // compatible with the server.
+        assert!(
+            curseforge_modloader_filter(Some(&ClassId::Datapacks), Some("fabric")).is_none(),
+            "the server's modloader must not narrow a datapack search"
+        );
+        assert_eq!(
+            modrinth_loader_filter(&ProjectType::DataPack, Some("fabric")),
+            None,
+            "the server's modloader must not narrow a datapack search"
+        );
+
+        // A vanilla server has no loader to narrow by in the first place.
+        assert!(curseforge_modloader_filter(Some(&ClassId::Mods), None).is_none());
+        assert_eq!(modrinth_loader_filter(&ProjectType::Mod, None), None);
+    }
+
+    #[test]
+    fn crash_restart_delay_grows_and_caps() {
+        assert_eq!(crash_restart_delay(1), std::time::Duration::from_secs(3));
+        assert_eq!(crash_restart_delay(2), std::time::Duration::from_secs(6));
+        assert_eq!(crash_restart_delay(3), std::time::Duration::from_secs(12));
+        assert_eq!(crash_restart_delay(4), std::time::Duration::from_secs(24));
+
+        // Eventually reaches the configured ceiling (well past MAX_ATTEMPTS,
+        // which is what actually stops the retries in practice — see
+        // `crash_restart_delay_never_zero` for the overflow-safety guarantee).
+        assert_eq!(
+            crash_restart_delay(20),
+            std::time::Duration::from_secs(CRASH_RESTART_MAX_DELAY_SECS)
+        );
+
+        // A pathologically large attempt count must not overflow the shift or
+        // wrap the delay back down — it just stays at the ceiling.
+        assert_eq!(
+            crash_restart_delay(u32::MAX),
+            std::time::Duration::from_secs(CRASH_RESTART_MAX_DELAY_SECS)
+        );
+    }
+
+    #[test]
+    fn crash_restart_delay_never_zero() {
+        // attempts is always >= 1 in practice (incremented before use), but
+        // guard the boundary explicitly: no delay would defeat the backoff.
+        assert!(crash_restart_delay(1) > std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn crash_restart_abandons_after_max_attempts_and_clears_on_manual_start() {
+        let manager = ServerManager::new();
+        let id = ServerId(1);
+
+        // CRASH_RESTART_MAX_ATTEMPTS consecutive fast (unhealthy) crashes are
+        // still within budget — auto-restart keeps retrying.
+        for _ in 0..CRASH_RESTART_MAX_ATTEMPTS {
+            let (_, abandoned) = manager.record_crash_restart_attempt(id, false);
+            assert!(!abandoned);
+        }
+        assert!(!manager.is_auto_restart_abandoned(id));
+
+        // One more fast crash past the cap — the seventh in a row — gives up
+        // and marks the server abandoned.
+        let (attempts, abandoned) = manager.record_crash_restart_attempt(id, false);
+        assert_eq!(attempts, CRASH_RESTART_MAX_ATTEMPTS + 1);
+        assert!(abandoned);
+        assert!(manager.is_auto_restart_abandoned(id));
+
+        // A manual start (the public `start_server`'s reset step) clears both
+        // the streak and the abandoned flag, handing the server one fresh
+        // retry cycle instead of staying permanently given up.
+        manager.crash_restart_state.remove(&id);
+        manager.crash_restart_abandoned.remove(&id);
+
+        assert!(!manager.is_auto_restart_abandoned(id));
+        let (attempts, abandoned) = manager.record_crash_restart_attempt(id, false);
+        assert_eq!(attempts, 1);
+        assert!(!abandoned);
+    }
+
+    // Pure decision logic (`reconcile_pid`, `is_live_java_process`,
+    // `PidReconcileAction`) and pidfile read/write/remove lifecycle tests
+    // now live in `managers::orphan_pid`, which both this manager and
+    // `InstanceManager` share.
+
+    // --- shutdown_running ---------------------------------------------
+
+    #[tokio::test]
+    async fn shutdown_running_kills_a_running_servers_handle() {
+        let manager = ServerManager::new();
+
+        let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+        let (stdin_tx, _stdin_rx) = mpsc::channel::<String>(1);
+        let (exited_tx, exited) = provider::exit_signal();
+        // Keep the process alive from the signal's point of view.
+        std::mem::forget(exited_tx);
+        let handle = ServerHandle {
+            process_id: 4242,
+            kill_tx,
+            stdin_tx,
+            exited,
+        };
+
+        manager.servers.write().await.insert(
+            ServerId(1),
+            ServerData {
+                shortpath: "test-server".to_string(),
+                state: ServerState::Running {
+                    start_time: Utc::now(),
+                    log_id: ServerLogId(1),
+                    process_id: 4242,
+                },
+                handle: Some(handle),
+                last_log_id: None,
+            },
+        );
+
+        manager.shutdown_running().await;
+
+        // `LocalServerProvider::kill` just forwards onto `kill_tx` —
+        // receiving on it confirms `shutdown_running` found the running
+        // server's handle and drove it through the same kill path
+        // `kill_server` uses.
+        assert!(
+            kill_rx.try_recv().is_ok(),
+            "expected shutdown_running to send a kill signal to the running server"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_running_ignores_stopped_servers_and_returns_promptly() {
+        let manager = ServerManager::new();
+
+        manager.servers.write().await.insert(
+            ServerId(1),
+            ServerData {
+                shortpath: "test-server".to_string(),
+                state: ServerState::Stopped { failed_task: None },
+                handle: None,
+                last_log_id: None,
+            },
+        );
+
+        // Must return promptly (well within the 3s bound) when nothing is
+        // running, and must not panic on a `None` handle.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.shutdown_running(),
+        )
+        .await
+        .expect("shutdown_running must not hang when no server is running");
+    }
+
+    #[tokio::test]
+    async fn shutdown_running_with_no_servers_at_all_returns_promptly() {
+        let manager = ServerManager::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.shutdown_running(),
+        )
+        .await
+        .expect("shutdown_running must not hang with an empty server map");
+    }
+
+    // --- wait_for_process_exit ----------------------------------------
+
+    fn running_server_with_handle() -> ServerData {
+        let (kill_tx, _kill_rx) = mpsc::channel::<()>(1);
+        let (stdin_tx, _stdin_rx) = mpsc::channel::<String>(1);
+        let (exited_tx, exited) = provider::exit_signal();
+        // Leak the far ends so the channels stay open — and the process stays
+        // un-exited — for the test's lifetime.
+        std::mem::forget(_kill_rx);
+        std::mem::forget(_stdin_rx);
+        std::mem::forget(exited_tx);
+        ServerData {
+            shortpath: "test-server".to_string(),
+            state: ServerState::Running {
+                start_time: Utc::now(),
+                log_id: ServerLogId(1),
+                process_id: 4242,
+            },
+            handle: Some(ServerHandle {
+                process_id: 4242,
+                kill_tx,
+                stdin_tx,
+                exited,
+            }),
+            last_log_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_process_exit_blocks_while_the_process_is_running() {
+        let manager = ServerManager::new();
+        manager
+            .servers
+            .write()
+            .await
+            .insert(ServerId(1), running_server_with_handle());
+
+        // The handle is still present (the JVM hasn't exited). The whole point
+        // of the fix is that the caller must NOT proceed to delete files yet, so
+        // the wait must still be pending — the outer timeout must elapse.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            manager.wait_for_process_exit(ServerId(1), std::time::Duration::from_secs(30)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "wait_for_process_exit returned while the process was still running"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_process_exit_returns_once_the_handle_is_cleared() {
+        let manager = ServerManager::new();
+        let mut stopped = running_server_with_handle();
+        stopped.handle = None;
+        stopped.state = ServerState::Stopped { failed_task: None };
+        manager.servers.write().await.insert(ServerId(1), stopped);
+
+        // Handle already cleared (process exited): must return promptly, not
+        // block for the full timeout.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.wait_for_process_exit(ServerId(1), std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("must return promptly once the handle is cleared");
+    }
+
+    #[tokio::test]
+    async fn wait_for_process_exit_is_bounded_when_the_process_never_exits() {
+        let manager = ServerManager::new();
+        manager
+            .servers
+            .write()
+            .await
+            .insert(ServerId(1), running_server_with_handle());
+
+        // The handle never clears; the call must still return, bounded by its
+        // own timeout rather than blocking the delete forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.wait_for_process_exit(ServerId(1), std::time::Duration::from_millis(300)),
+        )
+        .await
+        .expect("must be bounded by its own timeout");
+    }
 }

@@ -1,9 +1,11 @@
 import { useParams } from "@solidjs/router"
-import { rspc } from "@/utils/rspcClient"
+import { queryClient, rspc } from "@/utils/rspcClient"
 import { useGDNavigate } from "@/managers/NavigationManager"
 import { Mod as ModType, AddonType } from "@gd/core_module/bindings"
 import { useModal } from "@/managers/ModalsManager"
+import { requiresDeletionConfirmation } from "@/pages/Library/shared/addons/addonCapabilities"
 import { onCleanup } from "solid-js"
+import { resolveBooleanPreference } from "./resolveBooleanPreference"
 
 export const useAddonMutations = (
   refetchAddons: () => Promise<any>,
@@ -25,6 +27,31 @@ export const useAddonMutations = (
   const params = useParams<{ id: string }>()
   const navigator = useGDNavigate()
   const modalsContext = useModal()
+  const ctx = rspc.useContext()
+  const worldWarningDismissed = rspc.createQuery(() => ({
+    queryKey: ["settings.getWorldDeletionWarningDismissed"]
+  }))
+
+  // `worldWarningDismissed.data` is `undefined` until the query resolves, so
+  // reading it raw conflates "still loading" with "not dismissed" — a user
+  // who dismissed the warning previously and deletes a world quickly after
+  // mount (before the query settles) would still see the confirmation
+  // dialog they already opted out of.
+  const isWorldWarningDismissed = () =>
+    resolveBooleanPreference(worldWarningDismissed, () =>
+      queryClient
+        .ensureQueryData({
+          queryKey: ["settings.getWorldDeletionWarningDismissed"],
+          queryFn: () =>
+            ctx.client.query(["settings.getWorldDeletionWarningDismissed"])
+        })
+        // A rejected fetch must not read as "dismissed" — that would silently
+        // skip the confirmation dialog and delete a world with no prompt.
+        // Failing toward `false` instead means the worst case on error is an
+        // extra confirmation the user already opted out of, never a silent
+        // deletion.
+        .catch(() => false)
+    )
 
   // Track active polling intervals for cleanup
   const activeIntervals = new Set<number>()
@@ -123,7 +150,7 @@ export const useAddonMutations = (
     }
   }
 
-  const handleDeleteMod = async (mod: ModType) => {
+  const performDeleteMod = async (mod: ModType) => {
     // Deselect the addon being deleted
     setRowSelection((prev) => {
       const next = { ...prev }
@@ -148,7 +175,25 @@ export const useAddonMutations = (
     }
   }
 
-  const handleDeleteSelected = async (selectedMods: ModType[]) => {
+  const handleDeleteMod = async (mod: ModType) => {
+    if (
+      requiresDeletionConfirmation(mod.addon_type) &&
+      !(await isWorldWarningDismissed())
+    ) {
+      modalsContext?.openModal(
+        { name: "confirmWorldDeletion" },
+        {
+          worldName: mod.filename,
+          onConfirm: () => void performDeleteMod(mod)
+        }
+      )
+      return
+    }
+
+    await performDeleteMod(mod)
+  }
+
+  const performDeleteSelected = async (selectedMods: ModType[]) => {
     // Clear selection (all selected items are being deleted)
     setRowSelection({})
 
@@ -173,6 +218,31 @@ export const useAddonMutations = (
       // Rollback optimistic update on error
       optimisticUpdates.rollbackToServerState()
     }
+  }
+
+  const handleDeleteSelected = async (selectedMods: ModType[]) => {
+    const worldsSelected = selectedMods.filter((mod) =>
+      requiresDeletionConfirmation(mod.addon_type)
+    )
+
+    if (worldsSelected.length > 0 && !(await isWorldWarningDismissed())) {
+      modalsContext?.openModal(
+        { name: "confirmWorldDeletion" },
+        {
+          worldName: worldsSelected[0].filename,
+          worldCount: worldsSelected.length,
+          // Confirming deletes the whole selection, not only the worlds in
+          // it — the dialog is raised *because* a world is among them, but
+          // `performDeleteSelected` below removes every selected addon. The
+          // dialog names that total so it describes what the button does.
+          totalCount: selectedMods.length,
+          onConfirm: () => void performDeleteSelected(selectedMods)
+        }
+      )
+      return
+    }
+
+    await performDeleteSelected(selectedMods)
   }
 
   const handleOpenFolder = () => {

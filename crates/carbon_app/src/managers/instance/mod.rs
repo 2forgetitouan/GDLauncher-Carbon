@@ -1,10 +1,11 @@
 use self::export::InstanceExportManager;
 use self::importer::InstanceImportManager;
 use self::log::GameLog;
-use self::run::{LaunchState, PersistenceManager};
+use self::run::{LaunchState, PersistenceManager, RunningInstance};
 use super::ManagerRef;
 use super::metadata::cache;
 use super::modplatforms::curseforge::CurseForge;
+use super::orphan_pid;
 use super::vtask::{TaskState, VisualTask};
 use crate::api::keys::instance::*;
 use crate::api::translation::Translation;
@@ -27,6 +28,7 @@ use daedalus::minecraft::MinecraftJavaProfile;
 use dashmap::DashMap;
 use domain::info;
 use fs_extra::dir::CopyOptions;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::{Future, join};
 use instance_repo::InstanceRow as CachedInstance;
@@ -42,9 +44,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, io, ops::Deref, path::PathBuf};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, RwLock, watch};
-use tracing::{info, trace};
+use tracing::{error, info, trace, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod explore;
@@ -84,6 +87,12 @@ pub struct InstanceManager {
     modpack_info_semaphore: Mutex<()>,
     pub any_instance_running: Arc<watch::Sender<bool>>,
     instance_running_tracker: Arc<LivenessTracker>,
+    /// Results of the last completed (or failed-but-partial) run of
+    /// [`modpack::check_pack_origin`](ManagerRef::check_pack_origin) per
+    /// instance — read by `modpack::origin_verdict_for` when building a
+    /// repair preview. In-memory only: a restart clears it, same as every
+    /// other manager cache in this struct.
+    pub(crate) origin_checks: RwLock<HashMap<InstanceId, modpack::origin_check::OriginResults>>,
 }
 
 impl Default for InstanceManager {
@@ -111,6 +120,7 @@ impl InstanceManager {
             instance_running_tracker: LivenessTracker::new(move |count| {
                 drop(any_instance_running.send_replace(count != 0))
             }),
+            origin_checks: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -121,6 +131,23 @@ const ILLEGAL_NAMES: &[&str] = &[
     "con", "prn", "aux", "clock$", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
     "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
+
+/// Filename of the on-disk marker recording an instance's current game JVM
+/// pid. Lives directly under the instance's root directory
+/// (`InstancePath::get_root`, the parent of the `instance/` data dir) rather
+/// than inside the data dir, so a reinstall/repair that wipes `instance/`
+/// doesn't touch it, and deleting the instance (which removes the whole
+/// root) cleans it up for free. Both the writer (`run`, right after the game
+/// process is spawned) and the reader (`reconcile_running_instances_under`,
+/// on every core startup) compute the pidfile path from the same
+/// `InstancePath::get_root()` / directory-scan root, so they always agree
+/// on the location.
+///
+/// This file is the only channel by which a restarted core can learn that a
+/// game it did not spawn is still running: `LaunchState` lives in memory and
+/// dies with the process that held it, so without the pidfile a game that
+/// outlived the launcher would be invisible to the instance it belongs to.
+const PID_FILE_NAME: &str = ".gdl_instance.pid";
 
 fn sanitize_name(name: &str) -> String {
     let mut sanitized = name.trim().to_string();
@@ -163,14 +190,103 @@ fn path_length(path: &Path) -> usize {
     path.as_os_str().len()
 }
 
+/// Characters illegal in a Windows filename — and unsafe or meaningless in a
+/// path component on any other OS — that `sanitize_icon_filename` strips from
+/// a URL-derived icon name before it touches disk.
+const ILLEGAL_FILENAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Longest filename `download_icon` will write to disk, regardless of how
+/// long the URL's own last path segment is.
+const MAX_ICON_FILENAME_LEN: usize = 64;
+
+/// Turn a URL path segment into a filename safe to write directly to disk:
+/// every character illegal in a Windows filename becomes `_`, the result is
+/// capped to `MAX_ICON_FILENAME_LEN` characters, and a result that is empty
+/// or only dots (`.`, `..` — a bare `.`/`..` segment carries no name at all,
+/// and a leading `..` on a case that ever reached this far would otherwise
+/// walk out of the icon directory) falls back to a fixed safe name rather
+/// than passing through unchanged. The URL a `download_icon` filename is
+/// derived from is caller-supplied, so none of this is optional.
+fn sanitize_icon_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if ILLEGAL_FILENAME_CHARS.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(MAX_ICON_FILENAME_LEN)
+        .collect();
+
+    match sanitized.as_str() {
+        "" | "." | ".." => "icon".to_string(),
+        _ => sanitized,
+    }
+}
+
+/// The filename `download_icon` should use, derived from `url`'s own last
+/// path segment — `path_segments()` excludes `?query` and `#fragment` by
+/// construction, so `.../icon.png?width=64` yields `icon.png`, never
+/// `icon.png?width=64`. `None` when the URL has no non-empty path segment to
+/// use (e.g. it ends in `/`), so the caller can fall back to the response's
+/// `Content-Type` instead.
+fn icon_filename_from_url(url: &reqwest::Url) -> Option<String> {
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .map(sanitize_icon_filename)
+}
+
+/// The file extension implied by a response's `Content-Type` header value
+/// (`image/png` -> `png`), lowercased. `png` if the header is absent,
+/// unparseable, or has no `/subtype` to read one from.
+fn extension_from_content_type(content_type: Option<&str>) -> String {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .and_then(|mime| mime.trim().rsplit_once('/'))
+        .map(|(_, subtype)| subtype.trim().to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "png".to_string())
+}
+
+/// The filename `download_icon` actually writes to disk: `url_segment` (from
+/// `icon_filename_from_url`) verbatim when it already carries an extension
+/// (contains a `.`), otherwise with one appended from `content_type` — and
+/// the same content-type-derived extension, on a plain `icon` stem, when
+/// there was no usable URL segment at all. A URL segment with no extension
+/// (`.../noext`) must not silently lose the response's real content type the
+/// way falling back only on "no segment at all" would.
+fn icon_filename(url_segment: Option<String>, content_type: Option<&str>) -> String {
+    match url_segment {
+        Some(name) if name.contains('.') => name,
+        Some(name) => format!("{name}.{}", extension_from_content_type(content_type)),
+        None => format!("icon.{}", extension_from_content_type(content_type)),
+    }
+}
+
 impl<'s> ManagerRef<'s, InstanceManager> {
     pub async fn launch_background_tasks(self) {
-        let _ = self.scan_instances().await;
+        if let Err(e) = self.scan_instances().await {
+            error!("failed to scan instances: {e:?}");
+        }
         self.import_manager().launch_background_tasks();
     }
 
     pub async fn scan_instances(self) -> anyhow::Result<()> {
         let scan_start = std::time::Instant::now();
+
+        // Before scanning populates the in-memory instance map, reconcile
+        // every on-disk instance's pidfile against the live process table.
+        // `LaunchState` is in-memory only (never persisted), so the scan
+        // below yields every instance as freshly Inactive and the pidfile is
+        // the only surviving record that a game is still running — from a
+        // session that ended without stopping it, most often because the user
+        // closed the launcher. Each one found is applied to its instance as
+        // it is inserted below, so the map is never briefly wrong about it.
+        let adopted = self.reconcile_running_instances().await;
+
         let instance_cache = instance_repo::get_all_instances(&self.app.db).await?;
         tracing::debug!(
             "[startup-timing] scan_instances: loaded {} cached instance row(s) from DB in {:.2}s",
@@ -189,6 +305,11 @@ impl<'s> ManagerRef<'s, InstanceManager> {
 
         let updates_semaphore = Arc::new(tokio::sync::Semaphore::new(20));
         let mut scanned_count: u32 = 0;
+        // Instances that came out of this scan running a game this core does
+        // not own. Collected because nothing else will ever observe those
+        // processes exiting — there is no `child.wait()` behind them — so
+        // they need the liveness poller started for them.
+        let mut adopted_ids: Vec<InstanceId> = Vec::new();
 
         while let Some(dir) = stream.next_entry().await? {
             let path = dir.path();
@@ -200,55 +321,104 @@ impl<'s> ManagerRef<'s, InstanceManager> {
                 .expect("current GDL versions only support UTF8 paths")
                 .to_string();
 
-            let cached = instance_cache
-                .iter()
-                .find(|instance| instance.shortpath == shortpath);
+            // One directory's failure (an add_instance/get_default_group
+            // error — scan_instance itself never fails, converting a bad
+            // config into an Invalid instance instead) must not abort the
+            // whole scan: instances already adopted from earlier entries
+            // would then never reach the watcher spawn below, and every
+            // directory after this one would silently go unscanned too.
+            // Isolated and logged instead so the rest of the scan keeps
+            // going.
+            let entry_result: anyhow::Result<Option<InstanceId>> = async {
+                let cached = instance_cache
+                    .iter()
+                    .find(|instance| instance.shortpath == shortpath);
 
-            let Some(mut instance) = self.scan_instance(shortpath, path, cached).await? else {
-                continue;
-            };
-            let InstanceType::Valid(data) = &instance.type_ else {
-                continue;
-            };
-
-            let instance_id = match cached {
-                Some(cached) => InstanceId(cached.id),
-                None => {
-                    self.add_instance(
-                        data.config.name.clone(),
-                        instance.shortpath.clone(),
-                        self.get_default_group().await?,
-                    )
+                let Some(mut instance) = self
+                    .scan_instance(shortpath.clone(), path.clone(), cached)
                     .await?
+                else {
+                    return Ok(None);
+                };
+                let InstanceType::Valid(data) = &instance.type_ else {
+                    return Ok(None);
+                };
+
+                let instance_id = match cached {
+                    Some(cached) => InstanceId(cached.id),
+                    None => {
+                        self.add_instance(
+                            data.config.name.clone(),
+                            instance.shortpath.clone(),
+                            self.get_default_group().await?,
+                        )
+                        .await?
+                    }
+                };
+
+                let mut instances = self.instances.write().await;
+
+                if let (
+                    Instance {
+                        type_: InstanceType::Valid(data),
+                        ..
+                    },
+                    Some(Instance {
+                        type_: InstanceType::Valid(old_data),
+                        ..
+                    }),
+                ) = (&mut instance, instances.remove(&instance_id))
+                {
+                    data.state = old_data.state;
+                }
+
+                // A game this core did not spawn, still running: present the
+                // instance as Running with no channel to signal and no log to
+                // read (see `RunningInstance::adopted`). Guarded on the state
+                // rather than applied unconditionally so a rescan can never
+                // replace a state this core does own — the line above carries an
+                // already-Running instance forward, and overwriting it here would
+                // throw away its `kill_tx` and strand the process.
+                if let Some(game) = adopted.get(&instance.shortpath).copied() {
+                    if let InstanceType::Valid(data) = &mut instance.type_ {
+                        if matches!(data.state, LaunchState::Inactive { .. }) {
+                            data.state = LaunchState::Running(RunningInstance::adopted(
+                                game.pid,
+                                game.verified_start_time,
+                                game.start_time,
+                                Utc::now(),
+                            ));
+                            adopted_ids.push(instance_id);
+                        }
+                    }
+                }
+
+                instances.insert(instance_id, instance);
+                drop(instances);
+
+                self.app
+                    .meta_cache_manager()
+                    .queue_caching(
+                        crate::managers::metadata::cache::CacheEntityId::Instance(instance_id),
+                        false,
+                    )
+                    .await;
+
+                Ok(Some(instance_id))
+            }
+            .await;
+
+            let instance_id = match entry_result {
+                Ok(Some(instance_id)) => instance_id,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        "failed to scan instance directory {}: {e:?}",
+                        path.display()
+                    );
+                    continue;
                 }
             };
-
-            let mut instances = self.instances.write().await;
-
-            if let (
-                Instance {
-                    type_: InstanceType::Valid(data),
-                    ..
-                },
-                Some(Instance {
-                    type_: InstanceType::Valid(old_data),
-                    ..
-                }),
-            ) = (&mut instance, instances.remove(&instance_id))
-            {
-                data.state = old_data.state;
-            }
-
-            instances.insert(instance_id, instance);
-            drop(instances);
-
-            self.app
-                .meta_cache_manager()
-                .queue_caching(
-                    crate::managers::metadata::cache::CacheEntityId::Instance(instance_id),
-                    false,
-                )
-                .await;
 
             scanned_count += 1;
 
@@ -279,6 +449,10 @@ impl<'s> ManagerRef<'s, InstanceManager> {
 
         self.app.invalidate(GET_GROUPS, None);
         self.app.invalidate(GET_ALL_INSTANCES, None);
+
+        if !adopted_ids.is_empty() {
+            self.watch_adopted_instances(adopted_ids);
+        }
 
         Ok(())
     }
@@ -362,6 +536,22 @@ impl<'s> ManagerRef<'s, InstanceManager> {
                 }))
             }
         }
+    }
+
+    /// Reconcile every on-disk instance's pidfile against the live process
+    /// table, returning the games still running — by shortpath, because this
+    /// runs before any instance id exists — and discarding stale or reused
+    /// pids. Entirely best-effort: every failure is logged and swallowed so
+    /// this can never fail or delay startup scanning.
+    async fn reconcile_running_instances(self) -> HashMap<String, AdoptedGame> {
+        let instances_root = self
+            .app
+            .settings_manager()
+            .runtime_path
+            .get_instances()
+            .to_path();
+
+        reconcile_running_instances_under(&instances_root).await
     }
 
     pub async fn list_groups(self) -> anyhow::Result<Vec<ListGroup>> {
@@ -634,8 +824,8 @@ impl<'s> ManagerRef<'s, InstanceManager> {
                 .await?;
         }
 
-        // Also keep groupIndex in sync for backwards compatibility
-        // (This maintains the old ordering system while we transition)
+        // Also keep groupIndex in sync for backwards compatibility: it's the
+        // legacy ordering field, restamped here from the library-position order.
         let all_groups =
             instance_repo::get_groups_with_library_position_ordered(&self.app.db).await?;
 
@@ -1420,9 +1610,17 @@ impl<'s> ManagerRef<'s, InstanceManager> {
 
     /// Remove an instance from the database without checking if it exists.
     /// Does not invalidate.
+    ///
+    /// Deletes the instance and its `ModFileCache` rows in the same write
+    /// transaction (`delete_instance_tx`) rather than relying on the
+    /// `ON DELETE CASCADE` edge alone: the FK sweep falls back to leaving
+    /// foreign keys off for the whole session when it meets a violation it
+    /// cannot repair, and `GDL_DISABLE_FK_ENFORCEMENT=1` selects the same
+    /// state, so on those sessions the cascade never fires. Mirrors the
+    /// equivalent server-delete fix.
     async fn remove_instance(self, instance: InstanceId) -> anyhow::Result<()> {
         let instance_id = *instance;
-        instance_repo::delete_instance(&self.app.db, instance_id).await?;
+        instance_repo::delete_instance_tx(&self.app.db, instance_id).await?;
 
         self.app.meta_cache_manager().gc_mod_metadata().await;
 
@@ -1534,23 +1732,67 @@ impl<'s> ManagerRef<'s, InstanceManager> {
     }
 
     pub async fn download_icon(self, url: String) -> anyhow::Result<(String, Vec<u8>)> {
-        let extension = url
-            .rsplit_once('/')
-            .map(|(_, name)| name.rsplit_once('.'))
-            .flatten()
-            .map(|(_, ext)| ext)
-            .unwrap_or("png");
+        // The URL is caller-supplied. Only follow it over http(s) so a `file://`
+        // (or other) scheme can't be used to read arbitrary local resources.
+        let parsed = reqwest::Url::parse(&url).context("invalid icon url")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("icon url must be http or https");
+        }
 
-        let data = self
+        const MAX_ICON_BYTES: usize = 10 * 1024 * 1024;
+
+        let response = self
             .app
             .reqwest_client
             .get(&url)
             .send()
             .await?
-            .bytes()
-            .await?;
+            .error_for_status()?;
 
-        Ok((format!("icon.{extension}"), data.to_vec()))
+        // The parsed URL's own last path segment, never the raw query
+        // string: a URL like `.../icon.png?width=64` must yield `icon.png`,
+        // not `icon.png?width=64` — `path_segments()` already excludes
+        // `?query` and `#fragment` by construction. `icon_filename` falls
+        // back to the response's declared content type both when the URL
+        // has no usable segment at all (e.g. it ends in `/`) and when its
+        // segment has no extension of its own (e.g. `.../noext`).
+        let icon_name = icon_filename(
+            icon_filename_from_url(&parsed),
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+        );
+
+        // Read with a hard cap instead of `.bytes()` so a large (or endless)
+        // body can't exhaust memory.
+        let mut stream = response.bytes_stream();
+        let mut data = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if data.len() + chunk.len() > MAX_ICON_BYTES {
+                anyhow::bail!("icon exceeds the {MAX_ICON_BYTES} byte limit");
+            }
+            data.extend_from_slice(&chunk);
+        }
+
+        Ok((icon_name, data))
+    }
+
+    /// [`download_icon`](Self::download_icon), but for callers to whom an
+    /// icon is decorative rather than essential — a modpack archive import
+    /// that shouldn't fail just because the platform-supplied icon URL has
+    /// rotted. Any failure is `tracing::warn!`-logged and yields `None`
+    /// rather than propagating, leaving the caller free to fall back to
+    /// another icon source or import without one.
+    pub async fn try_download_icon(self, url: &str) -> Option<(String, Vec<u8>)> {
+        match self.download_icon(url.to_string()).await {
+            Ok(icon) => Some(icon),
+            Err(e) => {
+                tracing::warn!("Failed to download icon, continuing without it: {e}");
+                None
+            }
+        }
     }
 
     pub async fn set_loaded_icon(self, icon: (String, Vec<u8>)) {
@@ -2012,8 +2254,8 @@ impl<'s> ManagerRef<'s, InstanceManager> {
         let app = self.app.clone();
 
         // Run the actual deletion in a spawned task so the rspc call returns
-        // promptly, but log failures (previously they were dropped silently
-        // and the instance would re-appear next list).
+        // promptly, but log failures: a dropped one leaves the instance to
+        // re-appear on the next list.
         tokio::spawn(async move {
             if let Err(e) = app.instance_manager()._delete_instance(instance_id).await {
                 tracing::error!("Failed to delete instance {}: {:#}", instance_id.0, e);
@@ -2083,21 +2325,30 @@ impl<'s> ManagerRef<'s, InstanceManager> {
         };
 
         let mut instances = self.instances.write().await;
-        let instance = instances
-            .get_mut(&instance_id)
-            .ok_or(InvalidInstanceIdError(instance_id))?;
+        let Some(instance) = instances.get_mut(&instance_id) else {
+            // Already gone — e.g. a concurrent delete (double-clicked confirm)
+            // finished first. Deleting an absent instance is a no-op success,
+            // not a failure to surface to the user.
+            return Ok(());
+        };
 
         let InstanceType::Valid(data) = &mut instance.type_ else {
             return Err(anyhow!("Instance {instance_id} is not in a valid state"));
         };
 
-        // Refuse to delete an instance that is in use: tearing down a running or preparing
-        // instance would kill the game and remove its directory mid-session. It must be
-        // stopped first.
-        if !matches!(data.state, LaunchState::Inactive { .. }) {
-            return Err(anyhow!(
-                "Instance {instance_id} cannot be deleted while it is preparing or running; stop it first"
-            ));
+        // A running/preparing instance must be stopped first (tearing it down
+        // would kill the game and remove its directory mid-session). A second,
+        // redundant delete (double-clicked confirm) is a no-op — see
+        // `DeletePrecheck` — so it never resets the state the in-progress delete
+        // owns nor reports a spurious failure.
+        match delete_precheck(&data.state) {
+            DeletePrecheck::Proceed => {}
+            DeletePrecheck::AlreadyInProgress => return Ok(()),
+            DeletePrecheck::InUse => {
+                return Err(anyhow!(
+                    "Instance {instance_id} cannot be deleted while it is preparing or running; stop it first"
+                ));
+            }
         }
 
         data.state = LaunchState::Deleting;
@@ -2179,9 +2430,9 @@ impl<'s> ManagerRef<'s, InstanceManager> {
         instance_id: InstanceId,
         name: String,
     ) -> anyhow::Result<InstanceId> {
-        // Step 1: snapshot what we need from `instances` under a read lock and
+        // First snapshot what we need from `instances` under a read lock and
         // release it before the long fs copy. Holding `instances` across the
-        // copy serialized every other op (prepare_game, list_mods, etc.) for
+        // copy serializes every other op (prepare_game, list_mods, etc.) for
         // the entire duration of duplication.
         let (mut new_info, src_shortpath) = {
             let instances = self.instances.read().await;
@@ -2244,7 +2495,17 @@ impl<'s> ManagerRef<'s, InstanceManager> {
         // leaving the duplicate with the source's instance.json (its old name and metadata).
         tokio::fs::write(&tmppath.join("instance.json"), json).await?;
 
-        tokio::fs::rename(&tmppath, new_path).await?;
+        tokio::fs::rename(&tmppath, &new_path).await?;
+
+        // `fs_extra::dir::copy` above copied the whole source root, pidfile
+        // included if the source instance happened to be running — a game's
+        // pid (and its verified start time) belongs to that one process,
+        // never to a duplicate that has not launched anything. Left in
+        // place, a future startup reconcile pass could adopt the duplicate
+        // as if it were running the source's game, or Stop on the duplicate
+        // could signal the source's real, unrelated game process.
+        orphan_pid::remove_pid_file(&new_path, PID_FILE_NAME).await;
+
         let id = self
             .add_instance(
                 new_info.name.clone(),
@@ -2253,7 +2514,7 @@ impl<'s> ManagerRef<'s, InstanceManager> {
             )
             .await?;
 
-        // Step 2: only now reacquire the write lock to insert the new entry.
+        // Only now reacquire the write lock to insert the new entry.
         let mut instances = self.instances.write().await;
         instances.insert(
             id,
@@ -2369,7 +2630,7 @@ impl<'s> ManagerRef<'s, InstanceManager> {
 
         // Refuse the whole operation if any contained instance is preparing or running, before
         // deleting anything. Otherwise the per-instance delete below returns an error for the
-        // running instance (which the old code only logged) while the group row is removed
+        // running instance while the group row is removed
         // anyway, orphaning that instance: it keeps running with a dangling group id and vanishes
         // from list_groups (SQLite foreign keys are not enforced on this connection, so the group
         // row deletes regardless of the referencing row). Mirror the single-instance guard.
@@ -2430,6 +2691,54 @@ impl<'s> ManagerRef<'s, InstanceManager> {
         Ok(())
     }
 
+    /// Best-effort check of whether a user-set Java override resolves to a major
+    /// version incompatible with `required_profile`, using only already-scanned
+    /// Javas (no probing at details-fetch time). Returns false when there is no
+    /// override, no requirement, or the override's Java can't be identified
+    /// cheaply — a Path override to an unscanned binary is left for the
+    /// launch-time warning rather than probed here.
+    async fn java_override_mismatch(
+        &self,
+        java_override: &Option<info::JavaOverride>,
+        required_profile: Option<SystemJavaProfileName>,
+    ) -> bool {
+        let (Some(required), Some(java_override)) = (required_profile, java_override) else {
+            return false;
+        };
+
+        let resolved_version = match java_override {
+            info::JavaOverride::Path(Some(path)) => {
+                let Ok(all) = self.app.java_manager().get_available_javas().await else {
+                    return false;
+                };
+                all.values()
+                    .flatten()
+                    .find(|java| java.component.path == *path)
+                    .map(|java| java.component.version.clone())
+            }
+            info::JavaOverride::Profile(Some(name)) => {
+                let java_manager = self.app.java_manager();
+                let (Ok(profiles), Ok(all)) = (
+                    java_manager.get_java_profiles().await,
+                    java_manager.get_available_javas().await,
+                ) else {
+                    return false;
+                };
+                profiles
+                    .iter()
+                    .find(|profile| profile.name == *name)
+                    .and_then(|profile| profile.java_id.as_ref())
+                    .and_then(|java_id| all.values().flatten().find(|java| java.id == *java_id))
+                    .map(|java| java.component.version.clone())
+            }
+            _ => None,
+        };
+
+        resolved_version
+            .map(|version| !required.is_java_version_compatible(&version))
+            .unwrap_or(false)
+    }
+
     pub async fn instance_details(
         self,
         instance_id: InstanceId,
@@ -2462,24 +2771,22 @@ impl<'s> ManagerRef<'s, InstanceManager> {
             mc_manifest = manifest.ok();
         }
 
-        let required_java_profile = mc_version.clone().and_then(|version| {
-            let Some(manifest) = mc_manifest else {
-                return None;
-            };
-            let java = manifest
+        let required_java_profile_name = mc_version.clone().and_then(|version| {
+            let manifest = mc_manifest.as_ref()?;
+            let required_java = manifest
                 .versions
                 .iter()
                 .find(|profile| profile.id == version)
-                .and_then(|version| version.java_profile.clone());
+                .and_then(|version| version.java_profile.clone())?;
 
-            let Some(required_java) = java else {
-                return None;
-            };
-
-            SystemJavaProfileName::try_from(required_java)
-                .map(|v| v.to_string())
-                .ok()
+            SystemJavaProfileName::try_from(required_java).ok()
         });
+        let required_java_profile = required_java_profile_name.as_ref().map(|v| v.to_string());
+
+        let java_override = instance.config.game_configuration.java_override.clone();
+        let java_override_mismatch = self
+            .java_override_mismatch(&java_override, required_java_profile_name)
+            .await;
 
         Ok(domain::InstanceDetails {
             id: instance_id,
@@ -2505,8 +2812,9 @@ impl<'s> ManagerRef<'s, InstanceManager> {
                 Some(info::GameVersion::Custom(_)) => Vec::new(), // todo
                 None => Vec::new(),
             },
-            java_override: instance.config.game_configuration.java_override.clone(),
+            java_override,
             required_java_profile,
+            java_override_mismatch,
             state: (&instance.state).into(),
             notes: instance.config.notes.clone(),
             icon_revision,
@@ -2870,6 +3178,198 @@ pub struct InvalidGroupIdError(GroupId);
 #[error("attempted to get data of an invalid instance")]
 pub struct InvalidInstanceDataError;
 
+/// A game process found still running when the core started: one this core
+/// did not spawn, belonging to an instance that must therefore be presented
+/// as running without a handle to the process behind it.
+#[derive(Debug, Clone, Copy)]
+struct AdoptedGame {
+    pid: u32,
+    /// Taken from the pidfile's mtime, which is written immediately after the
+    /// spawn and so approximates the launch time to within a second — near
+    /// enough to keep playtime accounting roughly right across a restart
+    /// instead of resetting it.
+    start_time: DateTime<Utc>,
+    /// The sysinfo start time (seconds since epoch) `reconcile_pid` already
+    /// verified `pid` against, carried forward rather than re-derived. Every
+    /// later re-check of this pid (the adopted-instance poller,
+    /// `kill_instance`) verifies against this exact value — not a bare pid
+    /// lookup — since the game can exit and have its pid recycled by an
+    /// unrelated process at any point after this reconcile pass.
+    verified_start_time: u64,
+}
+
+/// Reconcile every instance directory directly under `instances_root`
+/// against the live process table, returning the games that are still
+/// running keyed by shortpath. Free function (not tied to
+/// `ManagerRef`/`InstanceManager`) so it is unit-testable against a plain
+/// temp directory laid out like the real instances root, without needing a
+/// full `App`.
+///
+/// Deliberately the opposite of `ServerManager::clean_up_orphaned_servers`,
+/// which kills what it finds: a pid sysinfo confirms is still alive AND
+/// still looks like java is the user's own game, left running by a session
+/// that ended without it — most often because they closed the launcher. It
+/// is adopted rather than killed, and its pidfile is kept, since that file
+/// stays the only record of the process for as long as it lives. Anything
+/// else (dead pid, or a live pid the process table says is no longer java,
+/// meaning the number was reused) just has its stale pidfile removed.
+async fn reconcile_running_instances_under(instances_root: &Path) -> HashMap<String, AdoptedGame> {
+    let mut adopted: HashMap<String, AdoptedGame> = HashMap::new();
+
+    let mut entries = match tokio::fs::read_dir(instances_root).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "Failed to read instances directory {} to reconcile running games: {}",
+                instances_root.display(),
+                e
+            );
+            return adopted;
+        }
+    };
+
+    // Pass 1: read every instance's pidfile (best-effort, one small file
+    // read each) and collect the recorded pids up front, so the process
+    // table only needs a single targeted refresh for this whole pass
+    // instead of a full system scan per instance.
+    let mut recorded: Vec<(String, PathBuf, Option<(u32, Option<u64>)>)> = Vec::new();
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(
+                    "Failed to read an instances directory entry while reconciling running games: {}",
+                    e
+                );
+                break;
+            }
+        };
+
+        // Each entry here is exactly `instances_root.join(shortpath)`, the
+        // same root `InstancePath::get_root()` computes for this instance.
+        let root = entry.path();
+        let Some(shortpath) = root.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        let pid = match orphan_pid::read_pid_file(&root, PID_FILE_NAME).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                warn!(
+                    "Failed to read pidfile for instance {} at {}: {} — removing it",
+                    shortpath,
+                    root.display(),
+                    e
+                );
+                // A pidfile that fails to parse can never be reconciled —
+                // there is no recorded pid to check against the process
+                // table — so it will only fail the same way again on every
+                // future startup unless it is cleaned up here, exactly like
+                // a stale-but-parseable one is by `RemoveStale`/`NotOurs`
+                // below.
+                orphan_pid::remove_pid_file(&root, PID_FILE_NAME).await;
+                None
+            }
+        };
+        recorded.push((shortpath.to_string(), root, pid));
+    }
+
+    let pids: Vec<Pid> = recorded
+        .iter()
+        .filter_map(|(_, _, pid)| pid.map(|(p, _)| Pid::from_u32(p)))
+        .collect();
+
+    let mut system = System::new();
+    if !pids.is_empty() {
+        system.refresh_processes(ProcessesToUpdate::Some(&pids));
+    }
+
+    // Pass 2: reconcile. A pid that is dead, alive but no longer java, or
+    // alive and java-looking but whose identity can't be proven (a legacy
+    // pidfile, or a start time that doesn't match what was recorded when
+    // this launcher spawned it) leaves nothing behind but a stale file to
+    // remove; only a live JVM whose start time matches is a game to adopt,
+    // and its pidfile stays exactly where it is.
+    for (shortpath, root, pid) in recorded {
+        let live = pid.and_then(|(p, _)| orphan_pid::live_proc(&system, p));
+
+        match orphan_pid::reconcile_pid(pid, live) {
+            orphan_pid::PidReconcileAction::NoPidFile => {}
+            orphan_pid::PidReconcileAction::RemoveStale => {
+                orphan_pid::remove_pid_file(&root, PID_FILE_NAME).await;
+            }
+            orphan_pid::PidReconcileAction::NotOurs => {
+                // Safe: NotOurs is only ever produced from `Some(pid)`.
+                let (pid, _) = pid.expect("NotOurs implies a recorded pid");
+                warn!(
+                    "Instance {} has a recorded pid ({}) that cannot be proven to still be its own game (legacy pidfile or start-time mismatch) — refusing to adopt it",
+                    shortpath, pid
+                );
+                orphan_pid::remove_pid_file(&root, PID_FILE_NAME).await;
+            }
+            orphan_pid::PidReconcileAction::StillRunning => {
+                // Safe: StillRunning is only ever produced from `Some(pid)`,
+                // and only when `live` matched it — see `reconcile_pid`.
+                let (pid, _) = pid.expect("StillRunning implies a recorded pid");
+                let verified_start_time = live
+                    .expect("StillRunning implies a live java process")
+                    .start_time;
+
+                // Falling back to "now" only understates how long the game has
+                // been up; it never invents playtime that was not played.
+                let start_time =
+                    tokio::fs::metadata(orphan_pid::pid_file_path(&root, PID_FILE_NAME))
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(DateTime::<Utc>::from)
+                        .unwrap_or_else(Utc::now);
+
+                info!(
+                    "Instance {} still has a game running (pid {}) from a previous launcher session — adopting it",
+                    shortpath, pid
+                );
+                adopted.insert(
+                    shortpath,
+                    AdoptedGame {
+                        pid,
+                        start_time,
+                        verified_start_time,
+                    },
+                );
+            }
+        }
+    }
+
+    adopted
+}
+
+/// Outcome of checking whether an instance may be deleted, given its launch state.
+#[derive(Debug, PartialEq, Eq)]
+enum DeletePrecheck {
+    /// Inactive — safe to delete.
+    Proceed,
+    /// Already being deleted. A double-clicked confirm spawns two delete tasks;
+    /// the second must be a no-op so it doesn't reset the `Deleting` state the
+    /// first task owns (which would open a window for a launch of a
+    /// being-deleted instance) or report a spurious failure.
+    AlreadyInProgress,
+    /// Queued/Preparing/Running — refuse; the instance must be stopped first,
+    /// otherwise the game is killed and its directory removed mid-session.
+    InUse,
+}
+
+fn delete_precheck(state: &LaunchState) -> DeletePrecheck {
+    match state {
+        LaunchState::Inactive { .. } => DeletePrecheck::Proceed,
+        LaunchState::Deleting => DeletePrecheck::AlreadyInProgress,
+        LaunchState::Queued(_) | LaunchState::Preparing(_) | LaunchState::Running(_) => {
+            DeletePrecheck::InUse
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{collections::HashSet, time::Duration};
@@ -2888,6 +3388,31 @@ mod test {
     };
 
     use super::InstanceVersionSource;
+
+    #[test]
+    fn delete_precheck_classifies_launch_states() {
+        use super::{DeletePrecheck, LaunchState, delete_precheck};
+        use crate::domain::vtask::VisualTaskId;
+
+        assert_eq!(
+            delete_precheck(&LaunchState::Inactive { failed_task: None }),
+            DeletePrecheck::Proceed
+        );
+        // The fix: a delete already in progress is a no-op, not a refusal — so a
+        // double-clicked confirm can't reset the state the first task owns.
+        assert_eq!(
+            delete_precheck(&LaunchState::Deleting),
+            DeletePrecheck::AlreadyInProgress
+        );
+        assert_eq!(
+            delete_precheck(&LaunchState::Queued(VisualTaskId(1))),
+            DeletePrecheck::InUse
+        );
+        assert_eq!(
+            delete_precheck(&LaunchState::Preparing(VisualTaskId(1))),
+            DeletePrecheck::InUse
+        );
+    }
 
     #[tokio::test]
     async fn move_groups() -> anyhow::Result<()> {
@@ -3608,5 +4133,596 @@ mod test {
         assert_eq!(instance_name.len(), 84); // UTF8 3 bytes * 28 allowed graphemes
 
         Ok(())
+    }
+
+    // --- startup pid reconciliation (instance-specific) ------------------
+    //
+    // The pidfile read/write/remove lifecycle and the `reconcile_pid` /
+    // `is_live_java_process` decision logic themselves are tested generically
+    // in `managers::orphan_pid`. These exercise
+    // `reconcile_running_instances_under` end to end against a plain temp
+    // directory laid out like the real instances root, using the actual
+    // `.gdl_instance.pid` file name.
+
+    /// The start time sysinfo currently reports for `pid`, via a targeted
+    /// refresh — the same lookup the real writer sites do right after
+    /// spawning a process, so tests can write a pidfile that reconciliation
+    /// will actually verify as matching.
+    fn live_start_time(pid: u32) -> u64 {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(
+            pid,
+        )]));
+        super::orphan_pid::process_start_time(&system, pid)
+            .expect("pid must be alive to look up its start time")
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_instances_removes_a_corrupt_pidfile() {
+        // A pidfile that fails to parse (garbage content, a bad upgrade, disk
+        // corruption) can never be reconciled — there is no recorded pid to
+        // check against the process table — so unlike a dead-but-parseable
+        // pid it must self-heal by being removed outright, or it would keep
+        // warning on every future startup forever.
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        tokio::fs::write(
+            super::orphan_pid::pid_file_path(&instance_root, super::PID_FILE_NAME),
+            b"not-a-pid",
+        )
+        .await
+        .unwrap();
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(adopted.is_empty(), "a corrupt pidfile must not be adopted");
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None,
+            "a corrupt pidfile must be removed, not left behind to fail the same way again"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_instances_removes_pidfile_for_a_dead_recorded_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        let dead_pid = u32::MAX - 100;
+        super::orphan_pid::write_pid_file(
+            &instance_root,
+            super::PID_FILE_NAME,
+            dead_pid,
+            1_700_000_000,
+        )
+        .await;
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(adopted.is_empty(), "a dead pid must not be adopted");
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None,
+            "a dead recorded pid's pidfile must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_instances_removes_pidfile_for_a_live_non_java_pid_without_killing() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        // Our own pid: alive for the duration of the test, but not java.
+        let own_pid = std::process::id();
+        super::orphan_pid::write_pid_file(
+            &instance_root,
+            super::PID_FILE_NAME,
+            own_pid,
+            live_start_time(own_pid),
+        )
+        .await;
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(
+            adopted.is_empty(),
+            "a live pid that is not java is a reused pid number, never a game to adopt"
+        );
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None,
+            "a live non-java recorded pid's pidfile must still be removed"
+        );
+        // Confirms reconciliation never tried to kill anything here: this
+        // test's own process is still alive to make this assertion at all.
+        assert!(
+            sysinfo::System::new_all()
+                .process(sysinfo::Pid::from_u32(own_pid))
+                .is_some()
+        );
+    }
+
+    /// A live process whose name is `java`, without needing a JRE installed:
+    /// `sysinfo` reports the executable's own name, so copying any
+    /// long-running binary to a file called `java` and running that produces
+    /// a process indistinguishable from a game JVM as far as
+    /// `is_live_java_process` is concerned — which is precisely the input the
+    /// adoption branch turns on.
+    ///
+    /// Unix-only, like the `sleep` it borrows. The branch it covers is
+    /// platform-independent.
+    #[cfg(unix)]
+    async fn spawn_fake_jvm(dir: &std::path::Path) -> tokio::process::Child {
+        let fake = dir.join("java");
+        tokio::fs::copy("/bin/sleep", &fake).await.unwrap();
+
+        tokio::process::Command::new(&fake)
+            .arg("60")
+            // Never outlive the test, however it ends.
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_running_instances_adopts_a_live_game_instead_of_killing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let mut fake_jvm = spawn_fake_jvm(bin_dir.path()).await;
+        let pid = fake_jvm.id().expect("fake jvm must have a pid");
+        let start_time = live_start_time(pid);
+
+        super::orphan_pid::write_pid_file(&instance_root, super::PID_FILE_NAME, pid, start_time)
+            .await;
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        let game = adopted.get("some-instance").expect(
+            "a live game JVM whose recorded start time matches must be adopted, not killed",
+        );
+        assert_eq!(game.pid, pid);
+        // The verified start time is carried into `AdoptedGame` rather than
+        // dropped: it is what `RunningInstance::adopted` threads onward so
+        // later re-checks (the poller, `kill_instance`) can tell this same
+        // process apart from whatever the OS hands the pid to next.
+        assert_eq!(game.verified_start_time, start_time);
+
+        // The process is the user's session and must survive being found.
+        assert!(
+            sysinfo::System::new_all()
+                .process(sysinfo::Pid::from_u32(pid))
+                .is_some(),
+            "reconciliation killed the adopted game process"
+        );
+        // And the pidfile has to stay: for as long as that process lives it
+        // is the only record of it, and a later startup needs it too.
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            Some((pid, Some(start_time))),
+            "an adopted game's pidfile must be left in place"
+        );
+
+        fake_jvm.kill().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_running_instances_drops_a_legacy_pidfile_for_a_live_game_without_adopting_it()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let mut fake_jvm = spawn_fake_jvm(bin_dir.path()).await;
+        let pid = fake_jvm.id().expect("fake jvm must have a pid");
+
+        // A pre-fix single-line pidfile: pid only, no start time to verify.
+        tokio::fs::write(
+            super::orphan_pid::pid_file_path(&instance_root, super::PID_FILE_NAME),
+            pid.to_string(),
+        )
+        .await
+        .unwrap();
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(
+            adopted.is_empty(),
+            "a legacy pidfile can never prove identity, so it must never be adopted even though the pid is alive and java-looking"
+        );
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None,
+            "an unverifiable legacy pidfile must still be removed"
+        );
+
+        fake_jvm.kill().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_running_instances_drops_a_pidfile_with_mismatched_start_time_without_adopting_it()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let mut fake_jvm = spawn_fake_jvm(bin_dir.path()).await;
+        let pid = fake_jvm.id().expect("fake jvm must have a pid");
+        let real_start_time = live_start_time(pid);
+
+        // A pidfile recording a start time far from the process's actual one
+        // — as if this pid had been reused by an unrelated process after the
+        // launcher's own JVM (which really did start at `real_start_time`
+        // minus a day) had already exited.
+        super::orphan_pid::write_pid_file(
+            &instance_root,
+            super::PID_FILE_NAME,
+            pid,
+            real_start_time.saturating_sub(86_400),
+        )
+        .await;
+
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(
+            adopted.is_empty(),
+            "a start-time mismatch means the pid was reused; it must never be adopted"
+        );
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None,
+            "an unverifiable pidfile must still be removed"
+        );
+
+        fake_jvm.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_instances_ignores_instances_with_no_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_root = dir.path().join("some-instance");
+        tokio::fs::create_dir_all(&instance_root).await.unwrap();
+
+        // Must not panic/fail when there's simply nothing to reconcile.
+        let adopted = super::reconcile_running_instances_under(dir.path()).await;
+
+        assert!(adopted.is_empty());
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&instance_root, super::PID_FILE_NAME)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_instances_under_tolerates_a_missing_directory() {
+        // Pointing at a directory that doesn't exist at all (e.g. a fresh
+        // install with no instances yet) must not panic or hang.
+        let bogus_root = std::path::Path::new("/nonexistent/gdl-test-instances-root");
+        let adopted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::reconcile_running_instances_under(bogus_root),
+        )
+        .await
+        .expect("reconcile_running_instances_under must not hang on a missing directory");
+
+        assert!(adopted.is_empty());
+    }
+
+    // --- duplicate_instance ------------------------------------------------
+
+    #[tokio::test]
+    async fn duplicate_instance_does_not_carry_the_source_pidfile() -> anyhow::Result<()> {
+        let app = crate::setup_managers_for_test().await;
+
+        let default_group_id = app.instance_manager().get_default_group().await?;
+        let instance_id = app
+            .instance_manager()
+            .create_instance(
+                default_group_id,
+                "source".to_string(),
+                false,
+                InstanceVersionSource::Version(info::GameVersion::Standard(
+                    info::StandardVersion {
+                        release: String::from("1.7.10"),
+                        modloaders: HashSet::new(),
+                    },
+                )),
+                String::new(),
+            )
+            .await?;
+
+        let source_root = {
+            let instance_manager = app.instance_manager();
+            let instances = instance_manager.instances.read().await;
+            let shortpath = instances[&instance_id].shortpath.clone();
+            app.settings_manager()
+                .runtime_path
+                .get_instances()
+                .get_instance_path(&shortpath)
+                .get_root()
+        };
+
+        // As if the source instance were running: the pidfile lives directly
+        // under the instance root, a sibling of the `instance/` data dir that
+        // `fs_extra::dir::copy` copies wholesale.
+        super::orphan_pid::write_pid_file(&source_root, super::PID_FILE_NAME, 4242, 1_700_000_000)
+            .await;
+
+        let duplicate_id = app
+            .instance_manager()
+            .duplicate_instance(instance_id, "duplicate".to_string())
+            .await?;
+
+        let duplicate_root = {
+            let instance_manager = app.instance_manager();
+            let instances = instance_manager.instances.read().await;
+            let shortpath = instances[&duplicate_id].shortpath.clone();
+            app.settings_manager()
+                .runtime_path
+                .get_instances()
+                .get_instance_path(&shortpath)
+                .get_root()
+        };
+
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&duplicate_root, super::PID_FILE_NAME).await?,
+            None,
+            "a duplicate must never carry the source's pidfile — it would let a future \
+             reconcile pass adopt the duplicate as if it were running the source's game, \
+             or let Stop on the duplicate signal the source's real process"
+        );
+        assert_eq!(
+            super::orphan_pid::read_pid_file(&source_root, super::PID_FILE_NAME).await?,
+            Some((4242, Some(1_700_000_000))),
+            "duplicating an instance must not disturb the source's own pidfile"
+        );
+
+        Ok(())
+    }
+
+    // --- scan_instances ------------------------------------------------
+
+    /// Write a minimal, valid `instance.json` directly to `dir` — the same
+    /// on-disk shape `scan_instances` reads, without going through
+    /// `create_instance` (which needs a resolvable game version) or the DB.
+    async fn write_test_instance_json(dir: &std::path::Path, name: &str) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        let config = info::Instance {
+            name: name.to_string(),
+            icon: info::InstanceIcon::Default,
+            date_created: chrono::Utc::now(),
+            date_updated: chrono::Utc::now(),
+            last_played: None,
+            seconds_played: 0,
+            modpack: None,
+            game_configuration: info::GameConfig {
+                version: None,
+                global_java_args: true,
+                extra_java_args: None,
+                memory: None,
+                java_override: None,
+                game_resolution: None,
+            },
+            pre_launch_hook: None,
+            post_exit_hook: None,
+            wrapper_command: None,
+            mod_sources: None,
+            notes: String::new(),
+        };
+        let json = super::schema::make_instance_config(config).unwrap();
+        tokio::fs::write(dir.join("instance.json"), json)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scan_instances_isolates_one_bad_entry_from_the_rest_of_the_scan() -> anyhow::Result<()>
+    {
+        use super::{InstanceType, LaunchState};
+        use carbon_repos::repos::app_configuration::AppConfigurationPatch;
+
+        let app = crate::setup_managers_for_test().await;
+
+        // App startup fires its own scan_instances pass in the background
+        // (unawaited — see managers/mod.rs). Nothing exists on disk for it
+        // to find yet, so it is a no-op, but without waiting for it here it
+        // can land at an arbitrary point during this test's own setup and
+        // race the scans below over the same instances directory.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let instances_dir = app
+            .settings_manager()
+            .runtime_path
+            .get_instances()
+            .to_path();
+
+        let good_root = instances_dir.join("instance-a");
+        write_test_instance_json(&good_root, "instance-a").await;
+
+        // Registers "instance-a" in the DB (cached) and creates the default
+        // group before anything is broken.
+        app.instance_manager().scan_instances().await?;
+
+        // Break group resolution for any directory the DB does not already
+        // know about: exactly what `add_instance` needs to register a *new*
+        // directory. Deterministic and order-independent — unlike a
+        // filesystem permission trick, it fails the same way on every call
+        // regardless of directory iteration order or already-open handles,
+        // and it leaves "instance-a" (already cached, so it never calls
+        // `get_default_group`) completely unaffected.
+        app.settings_manager()
+            .set(AppConfigurationPatch {
+                default_instance_group: Some(Some(999_999)),
+                ..Default::default()
+            })
+            .await?;
+
+        // As if a game were still running from a previous session: gives the
+        // already-cached "instance-a" something to adopt on the next scan.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let mut fake_jvm = spawn_fake_jvm(bin_dir.path()).await;
+        let pid = fake_jvm.id().expect("fake jvm must have a pid");
+        let start_time = live_start_time(pid);
+        super::orphan_pid::write_pid_file(&good_root, super::PID_FILE_NAME, pid, start_time).await;
+
+        // A brand new, never-before-seen directory: uncached, so it is the
+        // one that actually reaches (and fails on) the broken group
+        // resolution above.
+        let bad_root = instances_dir.join("instance-b");
+        write_test_instance_json(&bad_root, "instance-b").await;
+
+        app.instance_manager().scan_instances().await?;
+
+        let instance_manager = app.instance_manager();
+        let instances = instance_manager.instances.read().await;
+        let a = instances
+            .values()
+            .find(|i| i.shortpath == "instance-a")
+            .expect("instance-a must still be tracked");
+        let InstanceType::Valid(data) = &a.type_ else {
+            panic!("instance-a became invalid");
+        };
+        assert!(
+            matches!(&data.state, LaunchState::Running(r) if r.is_adopted()),
+            "instance-a must still be adopted even though a later directory in the \
+             same scan failed to register"
+        );
+        drop(instances);
+
+        assert!(
+            *instance_manager.any_instance_running.borrow(),
+            "the liveness poller for the adopted instance must have been spawned \
+             even though a later directory in the same scan failed"
+        );
+
+        fake_jvm.kill().await.unwrap();
+        Ok(())
+    }
+
+    // --- download_icon filename derivation ------------------------------
+
+    #[test]
+    fn icon_filename_from_url_strips_the_query_string() {
+        use super::icon_filename_from_url;
+
+        let url = reqwest::Url::parse("https://cdn/x/icon.png?width=64").unwrap();
+        assert_eq!(icon_filename_from_url(&url).as_deref(), Some("icon.png"));
+    }
+
+    #[test]
+    fn icon_filename_from_url_is_none_when_the_path_has_no_final_segment() {
+        use super::icon_filename_from_url;
+
+        let url = reqwest::Url::parse("https://cdn/").unwrap();
+        assert_eq!(icon_filename_from_url(&url), None);
+    }
+
+    #[test]
+    fn sanitize_icon_filename_replaces_illegal_characters_and_never_produces_a_path() {
+        use super::sanitize_icon_filename;
+
+        let sanitized = sanitize_icon_filename("a\\b?.png");
+        assert_eq!(sanitized, "a_b_.png");
+        assert!(
+            !sanitized.contains(['/', '\\']),
+            "a sanitized icon filename must never contain a path separator: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_icon_filename_caps_length() {
+        use super::sanitize_icon_filename;
+
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_icon_filename(&long).chars().count(), 64);
+    }
+
+    #[test]
+    fn sanitize_icon_filename_never_passes_through_a_bare_dot_segment() {
+        use super::sanitize_icon_filename;
+
+        // A `.`/`..` segment carries no name of its own, and `..` doctored
+        // through unchanged would claim (falsely) to be a safe filename
+        // while actually walking out of whatever directory it's joined to.
+        assert_eq!(sanitize_icon_filename("."), "icon");
+        assert_eq!(sanitize_icon_filename(".."), "icon");
+        assert_eq!(sanitize_icon_filename(""), "icon");
+    }
+
+    #[test]
+    fn extension_from_content_type_reads_the_subtype() {
+        use super::extension_from_content_type;
+
+        assert_eq!(extension_from_content_type(Some("image/png")), "png");
+        assert_eq!(
+            extension_from_content_type(Some("image/png; charset=utf-8")),
+            "png"
+        );
+        assert_eq!(extension_from_content_type(None), "png");
+        assert_eq!(extension_from_content_type(Some("garbage")), "png");
+    }
+
+    #[test]
+    fn icon_filename_keeps_a_url_segment_that_already_has_an_extension() {
+        use super::icon_filename;
+
+        assert_eq!(
+            icon_filename(Some("icon.png".to_string()), Some("image/jpeg")),
+            "icon.png",
+            "an extension already present in the URL must win over Content-Type"
+        );
+    }
+
+    #[test]
+    fn icon_filename_appends_a_content_type_extension_to_an_extensionless_segment() {
+        use super::icon_filename;
+
+        // The regression this closes: a URL segment with no extension of its
+        // own (`.../noext`) must not silently drop the response's real
+        // Content-Type just because *some* segment was found — only "no
+        // segment at all" is supposed to reach for a bare `icon.<ext>`.
+        assert_eq!(
+            icon_filename(Some("noext".to_string()), Some("image/png")),
+            "noext.png"
+        );
+        assert_eq!(
+            icon_filename(Some("noext".to_string()), None),
+            "noext.png",
+            "an extensionless segment with no Content-Type either must still fall back to png"
+        );
+    }
+
+    #[test]
+    fn icon_filename_falls_back_to_a_bare_icon_stem_with_no_url_segment_at_all() {
+        use super::icon_filename;
+
+        assert_eq!(icon_filename(None, Some("image/png")), "icon.png");
+        assert_eq!(icon_filename(None, None), "icon.png");
     }
 }

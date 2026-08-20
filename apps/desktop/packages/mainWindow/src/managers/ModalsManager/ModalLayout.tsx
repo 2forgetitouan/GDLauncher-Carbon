@@ -1,6 +1,6 @@
-import { Show, children } from "solid-js"
+import { Show, children, onCleanup, onMount } from "solid-js"
 import { JSX } from "solid-js/jsx-runtime"
-import { ModalProps, useModal } from "."
+import { ModalProps, useModal, useModalStackEntry } from "."
 import adSize from "@/utils/adhelper"
 
 interface Props extends ModalProps {
@@ -18,6 +18,20 @@ interface Props extends ModalProps {
 const ModalLayout = (props: Props) => {
   const c = children(() => props.children)
   const modalsContext = useModal()
+  const stackEntry = useModalStackEntry()
+
+  // Publishes this instance's live `preventClose` prop onto its stack entry
+  // so the manager's Escape handler and backdrop click can see it too — the
+  // manager also consults the static registry, but a prop-only
+  // `preventClose` (e.g. JavaSetup's) has no registry entry, so this is the
+  // only path that value reaches Escape/backdrop through.
+  onMount(() => {
+    stackEntry?.registerPreventClose(() => props.preventClose === true)
+  })
+
+  onCleanup(() => {
+    stackEntry?.unregisterPreventClose()
+  })
 
   return (
     <div
@@ -48,6 +62,7 @@ const ModalLayout = (props: Props) => {
           <div class="box-border flex items-center justify-between px-5 pt-3 pb-4">
             <h2 class="text-lg font-bold text-lightSlate-50">{props.title}</h2>
             <div
+              data-testid="modal-close"
               class="text-darkSlate-300 i-hugeicons:cancel-01 hover:text-lightSlate-100 h-5 w-5 press-effect active:scale-90 cursor-pointer"
               onClick={() => {
                 if (!props.preventClose) {

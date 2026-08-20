@@ -91,6 +91,7 @@ const AppNavbar = () => {
               }}
             />
             <img
+              data-testid="navbar-logo"
               src={wideLogoUrl}
               class="h-9 max-w-none transition-transform duration-200 ease-[cubic-bezier(.4,0,.2,1)]"
               classList={{
@@ -126,6 +127,7 @@ const AppNavbar = () => {
               <TabsTrigger
                 value="settings"
                 class="p-2"
+                data-testid="navbar-settings"
                 onClick={() => navigator.navigate("/settings")}
               >
                 <div class="i-hugeicons:settings-01 h-6 w-6" />

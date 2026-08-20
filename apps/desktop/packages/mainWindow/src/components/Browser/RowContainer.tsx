@@ -7,7 +7,7 @@ import {
 import { Trans } from "@gd/i18n"
 import { VersionRowTypeData } from "../InfiniteScrollVersionsQueryWrapper"
 import { For, Match, Show, Switch, createMemo } from "solid-js"
-import { format } from "date-fns"
+import { safeFormat } from "@/utils/date"
 import { Badge, Tooltip, TooltipContent, TooltipTrigger } from "@gd/ui"
 import ModDownloadButton from "../ModDownloadButton"
 import ModpackDownloadButton from "../ModpackDownloadButton"
@@ -112,7 +112,7 @@ const RowContainer = (props: Props & AdditionalProps) => {
 
           {/* Published date column */}
           <div class="text-lightSlate-300 flex items-center text-sm">
-            {format(new Date(props.modVersion.datePublished), "MMM dd, yyyy")}
+            {safeFormat(props.modVersion.datePublished, "MMM dd, yyyy")}
           </div>
 
           {/* Downloads column */}
@@ -159,9 +159,10 @@ const RowContainer = (props: Props & AdditionalProps) => {
                     splitPosition={
                       props.modVersion.serverPackFileId ? "left" : undefined
                     }
+                    testId="modpack-version-download-button"
                   />
                   <Show when={props.modVersion.serverPackFileId}>
-                    <div class="w-px self-stretch bg-primary-700 shrink-0" />
+                    <div class="bg-primary-700 w-px shrink-0 self-stretch" />
                     <ServerPackDownloadButton
                       addon={props.project}
                       fileId={fileId()}

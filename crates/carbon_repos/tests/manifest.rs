@@ -1,4 +1,4 @@
-//! Derived kind + lossiness tests (spec §10.2-10.3, CI matrix T5/T6/T11).
+//! Derived kind + lossiness tests.
 //!
 //! Kind derivation is exercised across every diff shape (additive column/table/
 //! non-unique index vs breaking drop/rebuild/unique-index/trigger/DML), both
@@ -25,7 +25,7 @@ fn fields(items: &[&str]) -> BTreeSet<String> {
 }
 
 // ------------------------------------------------------------------------
-// Kind derivation (spec §10.2)
+// Kind derivation
 // ------------------------------------------------------------------------
 
 #[test]
@@ -57,6 +57,106 @@ fn new_table_with_a_unique_index_is_additive() {
     let up = "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY, slug TEXT);\
               CREATE UNIQUE INDEX \"idx_c_slug\" ON \"C\" (slug);";
     assert_eq!(derive_kind(&[BASE], up).unwrap(), MigrationKind::Additive);
+}
+
+#[test]
+fn new_table_with_restricting_fk_to_existing_table_is_breaking() {
+    // RESTRICT on a new child table rejects the old binary's DELETE against the
+    // pre-existing parent, which is exactly the constraint class `Additive`
+    // promises is absent. The existing schema already uses RESTRICT.
+    let kind = derive_kind(
+        &[BASE],
+        "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY, aid INTEGER NOT NULL, \
+         CONSTRAINT \"c_aid_fkey\" FOREIGN KEY (aid) REFERENCES \"A\" (id) ON DELETE RESTRICT);",
+    )
+    .unwrap();
+    assert_eq!(kind, MigrationKind::Breaking);
+}
+
+#[test]
+fn new_table_with_default_no_action_fk_to_existing_table_is_breaking() {
+    // Omitting ON DELETE leaves NO ACTION, which rejects the parent delete just
+    // as RESTRICT does at the point the statement completes.
+    let kind = derive_kind(
+        &[BASE],
+        "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY, aid INTEGER NOT NULL, \
+         CONSTRAINT \"c_aid_fkey\" FOREIGN KEY (aid) REFERENCES \"A\" (id));",
+    )
+    .unwrap();
+    assert_eq!(kind, MigrationKind::Breaking);
+}
+
+#[test]
+fn restricting_fk_with_case_variant_parent_is_breaking() {
+    // SQLite identifiers are ASCII-case-insensitive: `PRAGMA foreign_key_list`
+    // reports the parent exactly as written in the REFERENCES clause, which
+    // need not match the referenced table's own declared case. `instance`
+    // here is the same table as `Instance` in `prev`, so a RESTRICT FK
+    // against it must still classify breaking.
+    let prev = "CREATE TABLE \"Instance\" (id INTEGER PRIMARY KEY);";
+    let kind = derive_kind(
+        &[prev],
+        "CREATE TABLE \"C\" (i INTEGER REFERENCES instance(id) ON DELETE RESTRICT);",
+    )
+    .unwrap();
+    assert_eq!(kind, MigrationKind::Breaking);
+}
+
+#[test]
+fn trigger_with_case_variant_table_is_breaking() {
+    // `sqlite_master.tbl_name` for a trigger is the `ON` clause's spelling
+    // verbatim, not resolved to the table's declared case (empirically
+    // confirmed: `ON instance` against `CREATE TABLE "Instance"` stores
+    // tbl_name = "instance"). A new trigger firing on a pre-existing table
+    // must still classify breaking regardless of which case its `ON` clause
+    // used.
+    let prev = "CREATE TABLE \"Instance\" (id INTEGER PRIMARY KEY);";
+    let up = "CREATE TRIGGER \"trg_probe\" AFTER INSERT ON instance BEGIN SELECT 1; END;";
+    assert_eq!(derive_kind(&[prev], up).unwrap(), MigrationKind::Breaking);
+}
+
+#[test]
+fn restricting_on_update_alone_does_not_make_a_new_table_breaking() {
+    // Only ON DELETE is consulted. ON UPDATE restricts rewrites of the
+    // referenced key, which is always a synthetic primary key nothing updates,
+    // and SQLite reports an omitted clause as NO ACTION — so honouring it would
+    // classify nearly every foreign key as breaking.
+    let kind = derive_kind(
+        &[BASE],
+        "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY, aid INTEGER NOT NULL, \
+         CONSTRAINT \"c_aid_fkey\" FOREIGN KEY (aid) REFERENCES \"A\" (id) \
+         ON UPDATE RESTRICT ON DELETE CASCADE);",
+    )
+    .unwrap();
+    assert_eq!(kind, MigrationKind::Additive);
+}
+
+#[test]
+fn new_table_with_non_restricting_fk_to_existing_table_is_additive() {
+    // CASCADE and SET NULL resolve the parent delete instead of rejecting it,
+    // so an old binary's writes still succeed.
+    for action in ["CASCADE", "SET NULL"] {
+        let up = format!(
+            "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY, aid INTEGER, \
+             CONSTRAINT \"c_aid_fkey\" FOREIGN KEY (aid) REFERENCES \"A\" (id) ON DELETE {action});"
+        );
+        let kind = derive_kind(&[BASE], &up).unwrap();
+        assert_eq!(kind, MigrationKind::Additive, "ON DELETE {action}");
+    }
+}
+
+#[test]
+fn new_table_with_fk_to_another_new_table_is_additive() {
+    // Both tables are invisible to the old binary, so no constraint can reject
+    // a write it is capable of making.
+    let kind = derive_kind(
+        &[BASE],
+        "CREATE TABLE \"C\" (id INTEGER PRIMARY KEY); \
+         CREATE TABLE \"D\" (id INTEGER PRIMARY KEY, cid INTEGER NOT NULL, \
+         CONSTRAINT \"d_cid_fkey\" FOREIGN KEY (cid) REFERENCES \"C\" (id) ON DELETE RESTRICT);",
+    )
+    .unwrap();
+    assert_eq!(kind, MigrationKind::Additive);
 }
 
 #[test]
@@ -131,7 +231,7 @@ fn dropped_index_is_breaking() {
 }
 
 // ------------------------------------------------------------------------
-// declared == derived, both directions (spec §10.2, CI T6)
+// declared == derived, both directions
 // ------------------------------------------------------------------------
 
 #[test]
@@ -185,7 +285,7 @@ fn data_down_parses_full_and_partial() {
 }
 
 // ------------------------------------------------------------------------
-// Seeded boundary-value round-trip (spec §10.3, CI T5)
+// Seeded boundary-value round-trip
 // ------------------------------------------------------------------------
 
 #[test]
@@ -274,7 +374,7 @@ fn dropped_integer_and_blob_columns_are_both_detected_lost() {
 }
 
 // ------------------------------------------------------------------------
-// Planted-failure self-tests (spec §10.2-10.3 item 5, CI T11)
+// Planted-failure self-tests
 // ------------------------------------------------------------------------
 
 #[test]
@@ -329,7 +429,7 @@ fn planted_stale_partial_declaration_fails() {
 }
 
 // ------------------------------------------------------------------------
-// Real committed schema (spec §10.3 item 4 against the shipped DDL)
+// Real committed schema, against the shipped DDL
 // ------------------------------------------------------------------------
 
 #[test]
@@ -360,7 +460,7 @@ fn derives_additive_for_a_nullable_add_on_the_real_schema() {
 }
 
 // ------------------------------------------------------------------------
-// Whole-list enforcement over get_migrations() (spec §10.2-10.3, CI T6)
+// Whole-list enforcement over get_migrations()
 // ------------------------------------------------------------------------
 
 #[test]
@@ -380,4 +480,77 @@ fn every_post_floor_migration_matches_its_declared_metadata() {
         verify_data_down(&prev, def.up_sql, down, def.data_down)
             .unwrap_or_else(|e| panic!("migration {} data_down: {e}", def.name));
     }
+}
+
+#[test]
+fn a_down_that_lowercases_text_is_reported_lossy() {
+    // The boundary seeder's TEXT choices must include a mixed-case ASCII
+    // string. Every other seeded string is either empty, already lowercase,
+    // or outside the ASCII range `lower()` folds by default, so `lower(v)` is
+    // a true no-op on all of them — only the mixed-case row can expose a down
+    // that silently lowercases (or uppercases) a TEXT column.
+    let prev = "CREATE TABLE \"N\" (id INTEGER PRIMARY KEY, v TEXT NOT NULL);";
+    let lost = seeded_lost_fields(&[prev], "", "UPDATE \"N\" SET v = lower(v);").unwrap();
+    assert!(
+        lost.contains("N.v"),
+        "a down that lowercases a mixed-case seeded value must be reported lossy: {lost:?}"
+    );
+}
+
+#[test]
+fn a_down_that_only_preserves_integer_datetimes_is_reported_lossy_for_text_ones() {
+    // The boundary seeder must seed a TEXT-shaped value into a DATETIME-
+    // declared column's boundary rows, not just integers: `DbDateTime` stores
+    // these as epoch-millis integers, but a legacy TEXT-shaped datetime is a
+    // representation the column's declared type equally admits (spec: the
+    // TEXT-legacy path is disjoint from the INTEGER path). The down below is a
+    // true no-op for every integer boundary value (and for NULL) and touches
+    // only a `typeof = 'text'` value, so it can only be caught if a TEXT row
+    // exists at all.
+    let prev = "CREATE TABLE \"D\" (id INTEGER PRIMARY KEY, v DATETIME NOT NULL);";
+    let down = "UPDATE \"D\" SET v = CASE WHEN typeof(v) = 'text' THEN 0 ELSE v END;";
+    let lost = seeded_lost_fields(&[prev], "", down).unwrap();
+    assert!(
+        lost.contains("D.v"),
+        "a transform that only preserves integer-shaped datetimes must be reported lossy \
+         once a TEXT-shaped datetime is also seeded: {lost:?}"
+    );
+}
+
+#[test]
+fn seeder_orders_and_links_a_case_variant_parent_reference() {
+    // The FK-topological seeder and its parent-row lookup both key off a
+    // table's canonical (declared) case, but `PRAGMA foreign_key_list`
+    // reports a foreign key's parent exactly as written in the `REFERENCES`
+    // clause. `instance` here is the same table as `Instance`: the seeder
+    // must both order `Instance` before `Child` and thread the real seeded
+    // parent row into `Child.iid` — if either lookup missed on case,
+    // `Child.iid` (NOT NULL) would seed NULL and the insert would fail
+    // outright, surfacing as an `Err` here instead of a lossless round trip.
+    let prev = "CREATE TABLE \"Instance\" (id INTEGER PRIMARY KEY);\
+                CREATE TABLE \"Child\" (id INTEGER PRIMARY KEY, \
+                iid INTEGER NOT NULL REFERENCES instance(id));";
+    let lost = seeded_lost_fields(&[prev], "", "").unwrap();
+    assert!(
+        lost.is_empty(),
+        "a no-op round trip over a case-variant FK reference must lose nothing: {lost:?}"
+    );
+}
+
+#[test]
+fn a_down_that_loses_rows_is_reported_lossy() {
+    // Row loss, not just column loss: the up rebuilds "B" and the down rebuilds
+    // it back with the right shape but restores only some of the rows. The
+    // schema round-trip cannot see this — it compares DDL over an empty
+    // database — so the seeded comparison is the only thing standing between a
+    // row-dropping down and a `data_down: "full"` declaration.
+    let up = "ALTER TABLE \"B\" ADD COLUMN extra TEXT;";
+    let down = "ALTER TABLE \"B\" DROP COLUMN extra; DELETE FROM \"B\" WHERE id > 0;";
+
+    let lost = seeded_lost_fields(&[BASE], up, down).unwrap();
+
+    assert!(
+        lost.contains("B.label"),
+        "a row that never came back must report its fields lost, got {lost:?}"
+    );
 }

@@ -1,11 +1,11 @@
-import { createSignal, Match, Switch } from "solid-js"
+import { createSignal, Match, Switch, onCleanup } from "solid-js"
 import type {
   ShaderRecommendation,
   ModSource,
   LatestModSource
 } from "@gd/core_module/bindings"
-import { Button } from "@gd/ui"
-import { Trans } from "@gd/i18n"
+import { Button, toast } from "@gd/ui"
+import { Trans, useTransContext } from "@gd/i18n"
 import Installing from "./Installing"
 import ModalLayout from "@/managers/ModalsManager/ModalLayout"
 import { ModalProps, useModal } from "@/managers/ModalsManager"
@@ -31,6 +31,10 @@ export interface StepProps {
   setStep: (step: WizardStep) => void
   setInstallPlan: (plan: InstallPlan) => void
   installPlan: () => InstallPlan
+  // Signals completion exactly once. Steps call this instead of
+  // `data.onComplete` directly so the owner's loading state is always cleared,
+  // including when the modal is dismissed via Escape or a backdrop click.
+  complete: (taskId: number | null) => void
 }
 
 const Intro = (props: StepProps) => {
@@ -48,7 +52,7 @@ const Intro = (props: StepProps) => {
   }
 
   const cancel = () => {
-    props.data.onComplete?.(null)
+    props.complete(null)
     modalsContext?.closeModal()
   }
 
@@ -90,7 +94,11 @@ const Intro = (props: StepProps) => {
           <Trans key="content:_trn_shader_loader_cancel" />
         </Button>
         <div class="flex gap-2">
-          <Button type="secondary" onClick={continueWithout}>
+          <Button
+            data-testid="shader-loader-continue-anyway"
+            type="secondary"
+            onClick={continueWithout}
+          >
             <Trans key="content:_trn_shader_loader_continue_anyway" />
           </Button>
           <Button type="primary" onClick={startAutoSetup}>
@@ -104,12 +112,42 @@ const Intro = (props: StepProps) => {
 }
 
 const ShaderLoaderSetup = (props: ModalProps) => {
+  const [t] = useTransContext()
   const [currentStep, setCurrentStep] = createSignal<WizardStep>("intro")
   const [installPlan, setInstallPlan] = createSignal<InstallPlan>({
     fileOnly: false
   })
+  const [installStarted, setInstallStarted] = createSignal(false)
 
   const data = (): ShaderLoaderSetupData => props?.data
+
+  // Wrapper that tracks when installation step is entered
+  const setStepTracked = (step: WizardStep) => {
+    if (step === "installing") setInstallStarted(true)
+    setCurrentStep(step)
+  }
+
+  // Notify the owner exactly once, whatever closes the modal. A backdrop click
+  // or Escape unmounts this component without running the Cancel/Install
+  // handlers, so onCleanup is what guarantees the owner's loading state clears.
+  let completed = false
+  const complete = (taskId: number | null) => {
+    if (completed) return
+    completed = true
+    if (taskId === null) {
+      const key = installStarted()
+        ? "notifications:_trn_shader_install_cancelled_mid_install"
+        : "notifications:_trn_shader_install_cancelled"
+      console.warn(
+        installStarted()
+          ? "[shader-wizard] cancelled after installation started"
+          : "[shader-wizard] cancelled before any install started"
+      )
+      toast(t(key), { duration: 4000 })
+    }
+    data().onComplete?.(taskId)
+  }
+  onCleanup(() => complete(null))
 
   return (
     <ModalLayout
@@ -121,7 +159,8 @@ const ShaderLoaderSetup = (props: ModalProps) => {
         <Match when={currentStep() === "intro"}>
           <Intro
             data={data()}
-            setStep={setCurrentStep}
+            complete={complete}
+            setStep={setStepTracked}
             setInstallPlan={setInstallPlan}
             installPlan={installPlan}
           />
@@ -129,7 +168,8 @@ const ShaderLoaderSetup = (props: ModalProps) => {
         <Match when={currentStep() === "installing"}>
           <Installing
             data={data()}
-            setStep={setCurrentStep}
+            complete={complete}
+            setStep={setStepTracked}
             setInstallPlan={setInstallPlan}
             installPlan={installPlan}
           />

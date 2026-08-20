@@ -27,6 +27,62 @@ use std::borrow::Cow;
 use std::str::FromStr;
 use thiserror::Error;
 
+/// Removes an addon's on-disk form — whichever of its enabled/disabled
+/// spellings exists — and reports whether anything was removed.
+///
+/// `is_directory` is true only for `AddonType::Worlds`. A world is installed by
+/// extracting its zip into `saves/` and deleting the zip
+/// (`managers/instance/installer/mod.rs`'s `post_process`), so the thing on
+/// disk is a directory and `remove_file` cannot touch it. Treating a world
+/// like a file would remove nothing while the caller drops the cache row
+/// anyway: the entry would vanish from the UI and the next scan would
+/// re-insert it from the still-present directory.
+async fn remove_addon_from_disk(
+    enabled_path: &std::path::Path,
+    disabled_path: &std::path::Path,
+    is_directory: bool,
+) -> anyhow::Result<bool> {
+    for path in [enabled_path, disabled_path] {
+        let Ok(meta) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+
+        if is_directory {
+            if meta.is_dir() {
+                tokio::fs::remove_dir_all(path).await?;
+                return Ok(true);
+            }
+        } else if meta.is_file() {
+            tokio::fs::remove_file(path).await?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Rejects an enable/disable toggle for an addon type that cannot express one.
+///
+/// Disabling appends `.disabled` to the name inside the type's folder, which is
+/// coherent for a file and incoherent for a world: a save is a directory,
+/// Minecraft still reads a renamed one, and our own scanner
+/// (`managers/metadata/cache/mod.rs`) re-reports `<name>.disabled` as a *new,
+/// enabled* world — leaving a duplicate row the UI has no control to undo.
+/// The frontend already declines to offer the control
+/// (`pages/Library/shared/addons/addonCapabilities.ts`'s `supportsEnableToggle`);
+/// this is the same rule where it cannot be routed around.
+fn ensure_toggleable(addon_type: domain::AddonType) -> anyhow::Result<()> {
+    if addon_type == domain::AddonType::Worlds {
+        bail!(
+            "worlds cannot be enabled or disabled: a save is a directory, and \
+             renaming it to <name>.disabled neither hides it from Minecraft nor \
+             from our own scanner, which re-reports it as a new, enabled world"
+        );
+    }
+
+    Ok(())
+}
+
 impl ManagerRef<'_, InstanceManager> {
     async fn ensure_modpack_not_locked(&self, instance_id: InstanceId) -> anyhow::Result<()> {
         let instances = self.instances.read().await;
@@ -317,6 +373,11 @@ impl ManagerRef<'_, InstanceManager> {
             .await?
             .ok_or(InvalidInstanceModIdError(instance_id, id.clone()))?;
 
+        let addon_type =
+            domain::AddonType::from_db_string(&m.addon_type).unwrap_or(domain::AddonType::Mods);
+
+        ensure_toggleable(addon_type)?;
+
         let mut disabled_path = {
             let instance_path = self
                 .app
@@ -325,9 +386,7 @@ impl ManagerRef<'_, InstanceManager> {
                 .get_instances()
                 .get_instance_path(shortpath);
 
-            domain::AddonType::from_db_string(&m.addon_type)
-                .unwrap_or(domain::AddonType::Mods)
-                .get_folder_path(&instance_path)
+            addon_type.get_folder_path(&instance_path)
         };
 
         let enabled_path = disabled_path.join(&m.filename);
@@ -386,6 +445,9 @@ impl ManagerRef<'_, InstanceManager> {
             .await?
             .ok_or(InvalidInstanceModIdError(instance_id, id))?;
 
+        let addon_type =
+            domain::AddonType::from_db_string(&m.addon_type).unwrap_or(domain::AddonType::Mods);
+
         let mut disabled_path = {
             let instance_path = self
                 .app
@@ -394,9 +456,7 @@ impl ManagerRef<'_, InstanceManager> {
                 .get_instances()
                 .get_instance_path(shortpath);
 
-            domain::AddonType::from_db_string(&m.addon_type)
-                .unwrap_or(domain::AddonType::Mods)
-                .get_folder_path(&instance_path)
+            addon_type.get_folder_path(&instance_path)
         };
 
         let enabled_path = disabled_path.join(&m.filename);
@@ -405,10 +465,40 @@ impl ManagerRef<'_, InstanceManager> {
         disabled.push_str(".disabled");
         disabled_path.push(disabled);
 
-        if enabled_path.is_file() {
-            tokio::fs::remove_file(enabled_path).await?;
-        } else if disabled_path.is_file() {
-            tokio::fs::remove_file(disabled_path).await?;
+        let removed = remove_addon_from_disk(
+            &enabled_path,
+            &disabled_path,
+            addon_type == domain::AddonType::Worlds,
+        )
+        .await?;
+
+        // Removing nothing is fine when there is nothing left to remove — the
+        // user may have deleted the file by hand, and dropping the stale cache
+        // row is the correct reconciliation. It is NOT fine when the addon is
+        // still sitting there: that means the removal failed, and dropping the
+        // row would hide it from the UI until the next scan resurrected it.
+        //
+        // Both spellings are probed, and the message names whichever one
+        // actually survived: an addon left behind under its `.disabled` name
+        // reported as still sitting at its enabled path sends whoever reads
+        // the error looking at a path that does not exist.
+        if !removed {
+            let survivor = if tokio::fs::metadata(&enabled_path).await.is_ok() {
+                Some(&enabled_path)
+            } else if tokio::fs::metadata(&disabled_path).await.is_ok() {
+                Some(&disabled_path)
+            } else {
+                None
+            };
+
+            if let Some(survivor) = survivor {
+                bail!(
+                    "refusing to drop the cache row for addon {} ({:?}): it is still on disk at {}",
+                    m.id,
+                    addon_type,
+                    survivor.display()
+                );
+            }
         }
 
         // Delete cache entry directly instead of re-scanning
@@ -1029,5 +1119,195 @@ mod test {
         assert_ne!(mods[0].curseforge, None);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_toggleable, remove_addon_from_disk};
+    use crate::domain::instance::AddonType;
+    use crate::domain::instance::info;
+    use crate::managers::instance::InstanceVersionSource;
+    use carbon_repos::dbtypes::DbDateTime;
+    use carbon_repos::repos::mod_file_cache as mfcdb;
+    use carbon_repos::repos::mod_metadata as metarepo;
+    use chrono::Utc;
+    use std::collections::HashSet;
+
+    #[test]
+    fn rejects_toggling_a_world() {
+        let err = ensure_toggleable(AddonType::Worlds)
+            .expect_err("a world must not be enableable/disableable");
+
+        assert!(
+            err.to_string().contains("worlds cannot be enabled"),
+            "the rejection must say why, got: {err}"
+        );
+    }
+
+    // Pins the guard at its call site rather than only as a standalone predicate:
+    // deleting the `ensure_toggleable` call in `enable_mod` must make this fail.
+    // Without it, enabling/disabling a `worlds` row renames `saves/MyWorld` to
+    // `saves/MyWorld.disabled`, which the scanner then re-reports as a new,
+    // enabled world with no control to undo it.
+    #[tokio::test]
+    async fn enable_mod_rejects_a_world() {
+        let app = crate::setup_managers_for_test().await;
+
+        let group = app.instance_manager().get_default_group().await.unwrap();
+        let instance_id = app
+            .instance_manager()
+            .create_instance(
+                group,
+                String::from("test"),
+                false,
+                InstanceVersionSource::Version(info::GameVersion::Standard(
+                    info::StandardVersion {
+                        release: String::from("1.20.1"),
+                        modloaders: HashSet::new(),
+                    },
+                )),
+                String::new(),
+            )
+            .await
+            .unwrap();
+
+        let now = DbDateTime(Utc::now().fixed_offset());
+        metarepo::insert_metadata(
+            &app.db,
+            "world-metadata",
+            0,
+            b"sha512",
+            b"sha1",
+            "vanilla",
+            None,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+
+        mfcdb::upsert_mod_file_cache(
+            &app.db,
+            *instance_id,
+            String::from("MyWorld"),
+            0,
+            true,
+            AddonType::Worlds.to_db_string().to_string(),
+            String::from("world-metadata"),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let row = mfcdb::get_mod_file_cache_by_instance_filename(&app.db, *instance_id, "MyWorld")
+            .await
+            .unwrap()
+            .expect("the seeded ModFileCache row for the world must be found");
+
+        let err = app
+            .instance_manager()
+            .enable_mod(instance_id, row.id, false)
+            .await
+            .expect_err("enable_mod must reject toggling a world");
+
+        assert!(
+            err.to_string().contains("worlds cannot be enabled"),
+            "must fail via the toggle guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_toggling_every_file_backed_addon() {
+        for addon_type in AddonType::all()
+            .into_iter()
+            .filter(|t| *t != AddonType::Worlds)
+        {
+            ensure_toggleable(addon_type)
+                .unwrap_or_else(|e| panic!("{addon_type:?} must stay toggleable, got: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn removes_a_world_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let world = dir.path().join("MyWorld");
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        std::fs::write(world.join("level.dat"), b"x").unwrap();
+
+        let removed = remove_addon_from_disk(&world, &dir.path().join("MyWorld.disabled"), true)
+            .await
+            .unwrap();
+
+        assert!(removed, "a world directory must be reported as removed");
+        assert!(
+            !world.exists(),
+            "the world directory must be gone from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_an_enabled_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pack.zip");
+        std::fs::write(&file, b"x").unwrap();
+
+        let removed = remove_addon_from_disk(&file, &dir.path().join("pack.zip.disabled"), false)
+            .await
+            .unwrap();
+
+        assert!(removed);
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn removes_a_disabled_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let disabled = dir.path().join("pack.zip.disabled");
+        std::fs::write(&disabled, b"x").unwrap();
+
+        let removed = remove_addon_from_disk(&dir.path().join("pack.zip"), &disabled, false)
+            .await
+            .unwrap();
+
+        assert!(removed);
+        assert!(!disabled.exists());
+    }
+
+    #[tokio::test]
+    async fn reports_nothing_removed_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let removed = remove_addon_from_disk(
+            &dir.path().join("gone.zip"),
+            &dir.path().join("gone.zip.disabled"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!removed, "an already-absent addon reports nothing removed");
+    }
+
+    // Guards the flag itself: a non-world addon whose path happens to be a
+    // directory must not be blown away with remove_dir_all.
+    #[tokio::test]
+    async fn leaves_a_directory_alone_for_file_addons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weird");
+        std::fs::create_dir(&path).unwrap();
+
+        let removed = remove_addon_from_disk(&path, &dir.path().join("weird.disabled"), false)
+            .await
+            .unwrap();
+
+        assert!(!removed);
+        assert!(
+            path.exists(),
+            "a directory must survive a file-addon delete"
+        );
     }
 }

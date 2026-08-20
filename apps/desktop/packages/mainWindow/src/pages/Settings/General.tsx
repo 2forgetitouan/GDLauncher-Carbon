@@ -50,6 +50,14 @@ const General = () => {
     queryKey: ["settings.getCacheSizes"]
   }))
 
+  const worldDeletionWarningDismissed = rspc.createQuery(() => ({
+    queryKey: ["settings.getWorldDeletionWarningDismissed"]
+  }))
+
+  const worldDeletionWarningMutation = rspc.createMutation(() => ({
+    mutationKey: ["settings.setWorldDeletionWarningDismissed"]
+  }))
+
   createEffect(() => {
     if (routeData.data.data) setSettings(routeData.data.data)
   })
@@ -435,20 +443,53 @@ const General = () => {
           </RightHandSide>
         </Row>
         <Row>
+          <Title
+            description={
+              <Trans key="settings:_trn_show_world_deletion_warning_text" />
+            }
+          >
+            <Trans key="settings:_trn_show_world_deletion_warning_title" />
+          </Title>
+          <RightHandSide>
+            {/* The anchor lives on this wrapping div rather than as a prop on
+                Switch: Switch spreads all its props onto the native
+                `<input type="checkbox">` it renders, but that input is
+                zero-size (`w-0 h-0`) — the visible, clickable surface is the
+                enclosing `<label>`. Same pattern as the mod-row toggle
+                (pages/Library/shared/addons/components/columns/enabledColumn.tsx). */}
+            <div data-testid="settings-world-deletion-warning">
+              <Switch
+                checked={!worldDeletionWarningDismissed.data}
+                onChange={(e) => {
+                  worldDeletionWarningMutation.mutate(!e.currentTarget.checked)
+                }}
+              />
+            </div>
+          </RightHandSide>
+        </Row>
+        <Row>
           <Title description={<Trans key="settings:_trn_potato_mode_text" />}>
             <Trans key="settings:_trn_potato_mode_title" />
           </Title>
           <RightHandSide>
-            <Switch
-              checked={settings.reducedMotion}
-              onChange={(e) => {
-                settingsMutation.mutate({
-                  reducedMotion: {
-                    Set: e.currentTarget.checked
-                  }
-                })
-              }}
-            />
+            {/* The anchor lives on this wrapping div rather than as a prop on
+                Switch: Switch spreads all its props onto the native
+                `<input type="checkbox">` it renders, but that input is
+                zero-size (`w-0 h-0`) — the visible, clickable surface is the
+                enclosing `<label>`. Same pattern as the mod-row toggle
+                (pages/Library/shared/addons/components/columns/enabledColumn.tsx). */}
+            <div data-testid="settings-reduced-motion-toggle">
+              <Switch
+                checked={settings.reducedMotion}
+                onChange={(e) => {
+                  settingsMutation.mutate({
+                    reducedMotion: {
+                      Set: e.currentTarget.checked
+                    }
+                  })
+                }}
+              />
+            </div>
           </RightHandSide>
         </Row>
         <Row>
@@ -474,6 +515,7 @@ const General = () => {
           <RightHandSide>
             <div class="flex flex-col items-center gap-2">
               <Button
+                data-testid="settings-cache-cleanup-open"
                 type="secondary"
                 size="small"
                 rounded={false}

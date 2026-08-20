@@ -18,6 +18,7 @@ import { listenServerEula } from "@/utils/serverEulaBridge"
 import { cleanupRunning } from "./modals/CacheCleanup/state"
 import { shaderInstallRunning } from "./modals/ShaderLoaderSetup/state"
 import { isChangingRuntimePath } from "./modals/ConfirmChangeRuntimePath/state"
+import { resolvePreventClose } from "./preventClose"
 
 export interface ModalProps {
   title: string
@@ -99,9 +100,9 @@ const getDefaultModals = (t: TypedTFunction) => ({
     component: lazy(() => import("./modals/ConfirmInstanceDeletion")),
     title: t("modals:_trn_confirm_instance_deletion")
   },
-  confirmReinstall: {
-    component: lazy(() => import("./modals/ConfirmReinstall")),
-    title: t("modals:_trn_confirm_reinstall")
+  repairModpack: {
+    component: lazy(() => import("./modals/RepairModpack")),
+    title: t("modals:_trn_repair_modpack")
   },
   confirmBatchInstanceDeletion: {
     component: lazy(() => import("./modals/ConfirmBatchInstanceDeletion")),
@@ -228,6 +229,10 @@ const getDefaultModals = (t: TypedTFunction) => ({
     component: lazy(() => import("./modals/InsufficientMemory")),
     title: t("java:_trn_insufficient_memory_title")
   },
+  confirmWorldDeletion: {
+    component: lazy(() => import("./modals/ConfirmWorldDeletion")),
+    title: t("instances:_trn_confirm_world_deletion_title")
+  },
   serverCreation: {
     component: lazy(() => import("./modals/ServerCreation")),
     title: "New Server"
@@ -260,9 +265,33 @@ interface Context {
   hasOpenModals: () => boolean
 }
 
-type Stack = { name: ModalName; data: any }[]
+export type StackEntry = {
+  name: ModalName
+  data: any
+  /** Live `preventClose` read for this modal instance, set by its mounted
+   *  ModalLayout (see `ModalStackEntryContext` below) and cleared on
+   *  unmount. Escape/backdrop OR this together with the static registry's
+   *  `preventClose` — either source can block the close. */
+  preventCloseAccessor?: () => boolean
+}
+
+type Stack = StackEntry[]
 
 const ModalsContext = createContext<Context>()
+
+export interface ModalStackEntryApi {
+  registerPreventClose: (_accessor: () => boolean) => void
+  unregisterPreventClose: () => void
+}
+
+// Lets the ModalLayout rendered for a given stack entry register its own
+// live `preventClose` prop so Escape/backdrop can see it — without this,
+// only the static registry's `preventClose` (keyed by modal name) reached
+// those two close paths, while a modal-instance-local prop only ever guarded
+// ModalLayout's own header close button.
+const ModalStackEntryContext = createContext<ModalStackEntryApi>()
+
+export const useModalStackEntry = () => useContext(ModalStackEntryContext)
 
 export const ModalProvider = (props: { children: JSX.Element }) => {
   const [t] = useTransContext()
@@ -330,6 +359,12 @@ export const ModalProvider = (props: { children: JSX.Element }) => {
     }
   }
 
+  // Whether the given stack entry currently blocks Escape/backdrop close —
+  // see `resolvePreventClose` for how the registry and the live ModalLayout
+  // accessor are combined.
+  const shouldPreventModalClose = (entry: StackEntry) =>
+    resolvePreventClose((defaultModals as Hash)[entry.name].preventClose, entry)
+
   onMount(() => {
     const cleanupMemory = listenMemoryWarning((data) => {
       manager.openModal({ name: "insufficientMemory" }, data)
@@ -337,9 +372,35 @@ export const ModalProvider = (props: { children: JSX.Element }) => {
     const cleanupEula = listenServerEula((data) => {
       manager.openModal({ name: "serverEulaAcceptance" }, data)
     })
+
+    // Escape closes the top modal, mirroring a backdrop click: skipped when the
+    // modal opts out of closing (preventClose), and when an open
+    // dropdown/select/menu (a Kobalte dismissable layer) should consume the
+    // Escape itself so one press doesn't dismiss both.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) {
+        return
+      }
+      const stack = modalStack()
+      if (stack.length === 0) {
+        return
+      }
+      if (document.querySelector('[role="listbox"],[role="menu"]')) {
+        return
+      }
+      const top = stack[stack.length - 1]
+      if (shouldPreventModalClose(top)) {
+        return
+      }
+      e.preventDefault()
+      closeModal()
+    }
+    document.addEventListener("keydown", onKeyDown)
+
     onCleanup(() => {
       cleanupMemory()
       cleanupEula()
+      document.removeEventListener("keydown", onKeyDown)
     })
   })
 
@@ -384,21 +445,26 @@ export const ModalProvider = (props: { children: JSX.Element }) => {
               const noHeader =
                 (defaultModals as Hash)[modal.name].noHeader || false
               const title = (defaultModals as Hash)[modal.name].title || ""
-              const preventCloseRaw = (defaultModals as Hash)[modal.name]
-                .preventClose
-              // Evaluate at click time so function-based preventClose stays
-              // reactive across phase changes inside the modal.
-              const shouldPreventClose = () =>
-                typeof preventCloseRaw === "function"
-                  ? preventCloseRaw()
-                  : preventCloseRaw === true
+
+              // Bound to this stack entry's own object (stable for the
+              // entry's lifetime — `<For>` only calls this mapper once per
+              // item), so the mounted ModalLayout's registration can never
+              // land on a different modal instance.
+              const stackEntryApi: ModalStackEntryApi = {
+                registerPreventClose: (accessor) => {
+                  modal.preventCloseAccessor = accessor
+                },
+                unregisterPreventClose: () => {
+                  modal.preventCloseAccessor = undefined
+                }
+              }
 
               return (
                 <div class="absolute inset-0 flex h-screen w-screen">
                   <div
                     class="z-999 relative flex h-full grow items-center justify-center"
                     onMouseDown={() => {
-                      if (!shouldPreventClose()) {
+                      if (!shouldPreventModalClose(modal)) {
                         closeModal()
                       }
                     }}
@@ -408,12 +474,14 @@ export const ModalProvider = (props: { children: JSX.Element }) => {
                       onMouseDown={(e) => e.stopPropagation()}
                       class="animate-modalEnter"
                     >
-                      <Dynamic
-                        component={ModalComponent}
-                        data={modal.data}
-                        noHeader={noHeader}
-                        title={title}
-                      />
+                      <ModalStackEntryContext.Provider value={stackEntryApi}>
+                        <Dynamic
+                          component={ModalComponent}
+                          data={modal.data}
+                          noHeader={noHeader}
+                          title={title}
+                        />
+                      </ModalStackEntryContext.Provider>
                     </div>
                     <div class="bg-darkSlate-900 absolute inset-0 opacity-95 transition-opacity duration-100" />
                   </div>
@@ -424,7 +492,7 @@ export const ModalProvider = (props: { children: JSX.Element }) => {
                       width: `${adSize.width}px`
                     }}
                     onMouseDown={() => {
-                      if (!shouldPreventClose()) {
+                      if (!shouldPreventModalClose(modal)) {
                         closeModal()
                       }
                     }}

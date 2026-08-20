@@ -20,11 +20,12 @@ import { Trans, useTransContext } from "@gd/i18n"
 import { getViewOnKey } from "@gd/i18n/helpers"
 import { toast } from "@gd/ui"
 import { useParams } from "@solidjs/router"
-import { AddonType } from "@gd/core_module/bindings"
+import { AddonType, Mod as ModType } from "@gd/core_module/bindings"
 import {
   AddonsPageLayout,
   createAddonColumns
 } from "@/pages/Library/shared/addons/components"
+import { supportsEnableToggle } from "@/pages/Library/shared/addons/addonCapabilities"
 import { useModal } from "@/managers/ModalsManager"
 import { useGDNavigate } from "@/managers/NavigationManager"
 import { getModImageUrl } from "@/utils/instances"
@@ -67,6 +68,19 @@ const Addons = () => {
 
   const isInstanceLocked = () =>
     !!routeData.instanceDetails.data?.modpack?.locked
+
+  /**
+   * Whether this row's addon type can be enabled/disabled at all.
+   *
+   * Worlds cannot (`supportsEnableToggle`): disabling renames the addon to
+   * `<name>.disabled`, and for a save — a directory — that neither hides it
+   * from Minecraft nor from our own scanner, which re-reports the renamed
+   * directory as a *new, enabled* world. Every route to the toggle has to
+   * respect that, not just the table's own column: a world dragged into a
+   * multi-selection would otherwise be swept up by "Disable all", and the
+   * row's own context menu offered it outright.
+   */
+  const canToggle = (addon: ModType) => supportsEnableToggle(addon.addon_type)
 
   const hasModloaders = () =>
     (routeData.instanceDetails.data?.modloaders?.length || 0) > 0
@@ -112,6 +126,14 @@ const Addons = () => {
       Object.keys(addonData.enabledAddonTypes) as AddonType[]
     ).filter((t) => addonData.enabledAddonTypes[t])
     if (enabled.length === 1) return enabled[0]
+    // `hasModloaders()` reads a field off `instanceDetails.data`, so it is
+    // false in two different situations: the instance genuinely has no
+    // modloaders, and the query has not resolved yet. Only the first of them
+    // means shaders. Treat a still-loading instance as modded — mods are the
+    // common case, this is a one-shot navigation decision that no later
+    // update can walk back, and a modded instance sent to the shaders
+    // catalogue finds nothing there.
+    if (!routeData.instanceDetails.data) return "mods"
     return hasModloaders() ? "mods" : "shaders"
   }
 
@@ -322,13 +344,21 @@ const Addons = () => {
                 })}
               </ContextMenuItem>
               <ContextMenuSeparator />
-              <Show when={selectedAddons().some((a) => !a.enabled)}>
+              {/* Both sweeps filter on `canToggle` as well as on `enabled`,
+                  and so do the `Show`s that offer them. A world is always
+                  reported enabled (the scanner hardcodes it — worlds have no
+                  disabled spelling), so an unfiltered "Disable all" would
+                  drag every world in a mixed selection into a rename that
+                  cannot disable it and that no control can undo. */}
+              <Show
+                when={selectedAddons().some((a) => !a.enabled && canToggle(a))}
+              >
                 <ContextMenuItem
                   disabled={isInstanceLocked()}
                   onSelect={() => {
                     Promise.all(
                       selectedAddons()
-                        .filter((a) => !a.enabled)
+                        .filter((a) => !a.enabled && canToggle(a))
                         .map((a) => addonMutations.handleToggleMod(a))
                     )
                   }}
@@ -337,13 +367,15 @@ const Addons = () => {
                   {t("content:_trn_enable_all")}
                 </ContextMenuItem>
               </Show>
-              <Show when={selectedAddons().some((a) => a.enabled)}>
+              <Show
+                when={selectedAddons().some((a) => a.enabled && canToggle(a))}
+              >
                 <ContextMenuItem
                   disabled={isInstanceLocked()}
                   onSelect={() => {
                     Promise.all(
                       selectedAddons()
-                        .filter((a) => a.enabled)
+                        .filter((a) => a.enabled && canToggle(a))
                         .map((a) => addonMutations.handleToggleMod(a))
                     )
                   }}
@@ -393,15 +425,18 @@ const Addons = () => {
                     {t("content:_trn_copy_name")}
                   </ContextMenuItem>
                   <ContextMenuSeparator />
-                  <ContextMenuItem
-                    disabled={isInstanceLocked()}
-                    onSelect={() => addonMutations.handleToggleMod(mod())}
-                  >
-                    <div class="i-hugeicons:toggle-off mr-2" />
-                    {mod().enabled
-                      ? t("content:_trn_disable_mod")
-                      : t("content:_trn_enable_mod")}
-                  </ContextMenuItem>
+                  <Show when={canToggle(mod())}>
+                    <ContextMenuItem
+                      data-testid="addon-context-toggle"
+                      disabled={isInstanceLocked()}
+                      onSelect={() => addonMutations.handleToggleMod(mod())}
+                    >
+                      <div class="i-hugeicons:toggle-off mr-2" />
+                      {mod().enabled
+                        ? t("content:_trn_disable_mod")
+                        : t("content:_trn_enable_mod")}
+                    </ContextMenuItem>
+                  </Show>
                   <Show when={mod().has_update}>
                     <ContextMenuItem
                       disabled={isInstanceLocked()}
@@ -608,6 +643,7 @@ const Addons = () => {
                   </Show>
                   <ContextMenuSeparator />
                   <ContextMenuItem
+                    data-testid="addon-context-delete"
                     disabled={isInstanceLocked()}
                     class="text-red-400 focus:text-red-300"
                     onSelect={() => addonMutations.handleDeleteMod(mod())}

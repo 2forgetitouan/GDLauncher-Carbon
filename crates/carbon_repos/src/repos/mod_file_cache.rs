@@ -269,6 +269,8 @@ queries! {
         "UPDATE ServerModFileCache SET enabled = :enabled, lastUpdatedAt = :updated_at WHERE id = :id";
     fn delete_server_mod_file_cache_by_id(id: &str) -> usize =
         "DELETE FROM ServerModFileCache WHERE id = :id";
+    fn delete_server_mod_file_cache_by_server(server_id: i32) -> usize =
+        "DELETE FROM ServerModFileCache WHERE serverId = :server_id";
 
     // --- instance mod list (full flat tree) ----------------------------------
     fn get_instance_mods_full(instance_id: i32) -> Vec<ModFullRow> =
@@ -564,6 +566,7 @@ const UPSERT_MOD_FILE_CACHE_CHECK: crate::registry::QueryCheck = crate::registry
     ],
     columns: None,
     class: crate::registry::class_of(UPSERT_MOD_FILE_CACHE_SQL),
+    routes_write: true,
 };
 
 /// SQL executed by `upsert_server_mod_file_cache`.
@@ -646,6 +649,7 @@ const UPSERT_SERVER_MOD_FILE_CACHE_CHECK: crate::registry::QueryCheck =
         ],
         columns: None,
         class: crate::registry::class_of(UPSERT_SERVER_MOD_FILE_CACHE_SQL),
+        routes_write: true,
     };
 
 /// Every checkable query in this module: the macro-generated `QUERIES` plus the

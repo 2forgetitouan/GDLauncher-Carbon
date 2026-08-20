@@ -1,16 +1,32 @@
-use super::provider::{ServerHandle, ServerProvider};
+use super::provider::{ServerHandle, ServerProvider, exit_signal, remove_pid_file, write_pid_file};
 use crate::domain::server::LaunchConfig;
+use crate::managers::orphan_pid;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use carbon_rt_path::ServerPath;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Notify, mpsc};
-use tracing::{error, info};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 pub struct LocalServerProvider;
+
+/// Converts a server's configured heap setting (MB) into a value safe to hand
+/// the JVM. A zero/negative setting is a corrupt config — failing loudly here
+/// beats silently booting the JVM with a nonsensical heap, which would
+/// otherwise crash the server on every boot (and feed the auto-restart loop).
+/// There is no upper clamp: the JVM validates its own `-Xmx`/`-Xms` bounds
+/// and rejects an unreasonable value with a clear error, so a deliberately
+/// large heap (e.g. 100 GB on a big host) reaches it unclamped instead of
+/// being silently rewritten down to ~464 MB by a raw `as u16` cast.
+fn heap_mb(v: i32) -> Result<u32> {
+    if v <= 0 {
+        anyhow::bail!("Server heap size must be positive, got {v} MB");
+    }
+    Ok(v as u32)
+}
 
 #[async_trait]
 impl ServerProvider for LocalServerProvider {
@@ -22,12 +38,21 @@ impl ServerProvider for LocalServerProvider {
         xms: i32,
         extra_args: &str,
         launch_config: &LaunchConfig,
+        modloader_type: Option<&str>,
         log_tx: mpsc::UnboundedSender<String>,
     ) -> Result<ServerHandle> {
         let data_path = server_path.get_data_path();
+        let server_root = server_path.get_root();
+
+        let xms = heap_mb(xms)?;
+        let xmx = heap_mb(xmx)?;
 
         let mut cmd = tokio::process::Command::new(java_path);
-        cmd.arg(format!("-Xmx{}m", xmx))
+        // Without this, a process still running when the app exits without an
+        // orderly per-server shutdown (crash, force-quit) is never signalled and
+        // is orphaned as a live JVM.
+        cmd.kill_on_drop(true)
+            .arg(format!("-Xmx{}m", xmx))
             .arg(format!("-Xms{}m", xms));
 
         // Add extra JVM args from modloader config
@@ -64,13 +89,21 @@ impl ServerProvider for LocalServerProvider {
                 cmd.arg("-cp").arg(&classpath);
             }
             cmd.arg(main_class);
-        } else {
-            // Vanilla or Fabric/Quilt: use -jar
-            let jar_name = launch_config.jar_path.as_deref().unwrap_or("server.jar");
+        } else if let Some(jar_name) = &launch_config.jar_path {
+            // Fabric/Quilt: a loader-specific launcher jar was resolved by name.
             let jar_path = data_path.join(jar_name);
 
             if !jar_path.exists() {
-                // Fallback to default server.jar
+                // The resolved jar has since gone missing. For a modded server
+                // this must not silently fall back to the untouched vanilla
+                // server.jar — refuse instead of masking a broken install.
+                if let Some(modloader) = modloader_type {
+                    anyhow::bail!(
+                        "Modded server has no valid launch configuration for {modloader} (expected {} to exist) — reinstall the server to repair it.",
+                        jar_path.display()
+                    );
+                }
+
                 let default_jar = server_path.get_server_jar_path();
                 if !default_jar.exists() {
                     anyhow::bail!("Server jar not found at {}", jar_path.display());
@@ -79,6 +112,27 @@ impl ServerProvider for LocalServerProvider {
             } else {
                 cmd.arg("-jar").arg(&jar_path);
             }
+        } else {
+            // Nothing loader-specific was resolved at all (no args_file, no
+            // main_class, no jar_path). For a genuine vanilla server this is
+            // the normal case — launch server.jar. For a modded server
+            // (modloader_type set) it means the launch config never got
+            // populated (interrupted install, or a config predating the
+            // args-file lookup): server.jar is always present (it's
+            // downloaded unconditionally at create time) regardless of
+            // modloader, so silently launching it here would boot a vanilla
+            // server that modded clients cannot join. Refuse instead.
+            if let Some(modloader) = modloader_type {
+                anyhow::bail!(
+                    "Modded server has no valid launch configuration for {modloader} — reinstall the server to repair it."
+                );
+            }
+
+            let default_jar = server_path.get_server_jar_path();
+            if !default_jar.exists() {
+                anyhow::bail!("Server jar not found at {}", default_jar.display());
+            }
+            cmd.arg("-jar").arg(&default_jar);
         }
 
         // Add extra game args from modloader config
@@ -96,6 +150,26 @@ impl ServerProvider for LocalServerProvider {
         let pid = child.id().unwrap_or(0);
 
         info!("Server process started with PID {}", pid);
+
+        // Best-effort: record the pid and its start time so a future
+        // `load_servers` pass can prove this is still the same JVM and kill
+        // it, if the core exits without going through `stop`/`kill` first
+        // (crash, force-quit, Windows TerminateProcess — none of which run
+        // the kill/wait task below). Never blocks or fails the launch on
+        // write failure. If the process has already exited by the time its
+        // start time is looked up, the pidfile is skipped entirely rather
+        // than written without one — an unverifiable pidfile could later be
+        // matched against an unrelated process that reused the pid, which is
+        // worse than leaving no pidfile at all.
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]));
+        match orphan_pid::process_start_time(&system, pid) {
+            Some(start_time) => write_pid_file(&server_root, pid, start_time).await,
+            None => warn!(
+                "Could not determine start time for server process (pid {}); not writing a pidfile for it",
+                pid
+            ),
+        }
 
         // Set up stdin channel
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(64);
@@ -144,9 +218,9 @@ impl ServerProvider for LocalServerProvider {
 
         // Set up kill channel and exit notification
         let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
-        let exit_notify = Arc::new(Notify::new());
-        let exit_notify_clone = exit_notify.clone();
+        let (exited_tx, exited) = exit_signal();
         let log_tx_exit = log_tx;
+        let exit_server_root = server_root.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = kill_rx.recv() => {
@@ -172,14 +246,18 @@ impl ServerProvider for LocalServerProvider {
                     }
                 }
             }
-            exit_notify_clone.notify_waiters();
+            // Best-effort: the process is gone either way (killed or exited
+            // on its own), so the pidfile no longer refers to anything a
+            // future `load_servers` pass needs to clean up.
+            remove_pid_file(&exit_server_root).await;
+            let _ = exited_tx.send(true);
         });
 
         Ok(ServerHandle {
             process_id: pid,
             kill_tx,
             stdin_tx,
-            exit_notify,
+            exited,
         })
     }
 
@@ -208,5 +286,96 @@ impl ServerProvider for LocalServerProvider {
             .await
             .context("Failed to send command to server")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heap_mb_honors_large_heaps_and_rejects_non_positive() {
+        // A deliberately large heap must reach the JVM unclamped — the old
+        // u16::MAX cap silently rewrote a 100 GB `-Xmx100000m` down to ~464 MB.
+        assert_eq!(heap_mb(100_000).unwrap(), 100_000);
+        assert_eq!(format!("-Xmx{}m", heap_mb(100_000).unwrap()), "-Xmx100000m");
+
+        // A normal, already-sane value passes through unchanged.
+        assert_eq!(heap_mb(1024).unwrap(), 1024);
+
+        // Zero/negative is a corrupt config; fail loud rather than silently
+        // booting the JVM with a nonsensical heap.
+        assert!(heap_mb(0).is_err());
+        assert!(heap_mb(-100).is_err());
+    }
+
+    #[tokio::test]
+    async fn modded_server_with_no_launch_config_refuses_to_boot_vanilla() {
+        // Regression: a modded server whose launch config resolved to nothing
+        // (no args_file, no main_class, no jar_path) used to fall through to
+        // `-jar server.jar` — silently booting vanilla instead of surfacing
+        // the broken install. The vanilla server.jar always exists (it's
+        // downloaded unconditionally at create time), so this must be caught
+        // before ever reaching `cmd.spawn()`.
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = ServerPath::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(server_path.get_data_path()).unwrap();
+        std::fs::write(server_path.get_server_jar_path(), b"jar").unwrap();
+
+        let (log_tx, _log_rx) = mpsc::unbounded_channel();
+        let provider = LocalServerProvider;
+        let result = provider
+            .start(
+                // Never reached if the guard fires correctly — spawning this
+                // would fail anyway (ENOENT), but with a different message.
+                Path::new("/nonexistent/gdl-test-java-binary"),
+                &server_path,
+                1024,
+                1024,
+                "",
+                &LaunchConfig::vanilla(),
+                Some("neoforge"),
+                log_tx,
+            )
+            .await;
+
+        let err = result.expect_err("expected the modded-vanilla-fallback guard to fire");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Modded server has no valid launch configuration"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vanilla_server_without_modloader_type_still_attempts_to_launch() {
+        // A genuine vanilla server (modloader_type: None) must still reach the
+        // spawn attempt instead of being caught by the modded-only guard.
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = ServerPath::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(server_path.get_data_path()).unwrap();
+        std::fs::write(server_path.get_server_jar_path(), b"jar").unwrap();
+
+        let (log_tx, _log_rx) = mpsc::unbounded_channel();
+        let provider = LocalServerProvider;
+        let result = provider
+            .start(
+                Path::new("/nonexistent/gdl-test-java-binary"),
+                &server_path,
+                1024,
+                1024,
+                "",
+                &LaunchConfig::vanilla(),
+                None,
+                log_tx,
+            )
+            .await;
+
+        let err = result.expect_err("spawning a nonexistent binary must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to spawn server process"),
+            "expected a spawn failure (proving the vanilla path was allowed through), got: {msg}"
+        );
     }
 }

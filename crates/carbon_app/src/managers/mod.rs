@@ -31,6 +31,7 @@ pub(crate) mod metadata;
 mod metrics;
 mod minecraft;
 pub mod modplatforms;
+mod orphan_pid;
 pub mod rich_presence;
 pub mod server;
 mod settings;
@@ -103,11 +104,29 @@ mod app {
             runtime_path: PathBuf,
             gdl_base_api: String,
         ) -> App {
-            let latest_tos_privacy_checksum =
-                TermsAndPrivacy::get_latest_consent_sha(&gdl_base_api)
-                    .await
-                    .map_err(DatabaseError::TermsAndPrivacy)
-                    .ok();
+            // Bounds the pre-DB-load terms/privacy fetch so a stalled connection can't
+            // block startup forever. Generous enough for the HTTP client's own timeout
+            // and a couple of retries to play out; still finite. A timeout here is not
+            // fatal: it's handled exactly like any other fetch failure below, which
+            // just seeds the DB without a known checksum.
+            const TERMS_CONSENT_FETCH_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(90);
+
+            let latest_tos_privacy_checksum = match tokio::time::timeout(
+                TERMS_CONSENT_FETCH_TIMEOUT,
+                TermsAndPrivacy::get_latest_consent_sha(&gdl_base_api),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(DatabaseError::TermsAndPrivacy).ok(),
+                Err(_) => {
+                    error!(
+                        "Timed out after {:?} fetching latest terms and privacy checksum",
+                        TERMS_CONSENT_FETCH_TIMEOUT
+                    );
+                    None
+                }
+            };
 
             let loaded_db = match db_bootstrap::load_and_migrate(
                 runtime_path.clone(),
@@ -118,7 +137,7 @@ mod app {
                 Ok(loaded_db) => loaded_db,
                 Err(e) => {
                     // Fatal DB outcomes already emitted their `_STATUS_:` line
-                    // through the funnel (spec §13); Electron shows the recovery
+                    // through the funnel; Electron shows the recovery
                     // ladder from that line. Exit cleanly so the status line is
                     // the single signal rather than burying it under a panic
                     // backtrace.
@@ -127,7 +146,13 @@ mod app {
                         .unwrap_or(false)
                     {
                         error!("Fatal database error; status already emitted, exiting gracefully");
-                        std::process::exit(2);
+                        // Exits through `logger::flush_and_exit` rather than a
+                        // bare `std::process::exit`: the latter skips the file
+                        // log's `WorkerGuard` drop entirely, which can lose
+                        // this line (and the one just emitted in
+                        // `load_and_migrate`) under CPU contention — the exact
+                        // diagnostic a failed launch needs most.
+                        crate::logger::flush_and_exit(2);
                     }
                     error!("Database migration failed: {}", e);
                     panic!("Database migration failed: {}", e);

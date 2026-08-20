@@ -127,6 +127,57 @@ fn upsert(out: &mut Vec<RequiredFile>, path: PathBuf, expected_sha1: Option<Stri
     }
 }
 
+/// Whether an existing output looks complete rather than half-written.
+///
+/// Processors stream their target out of a JVM subprocess, so an interruption
+/// leaves a zero-byte or truncated file at exactly the path an existence check
+/// accepts. Hashes cannot stand in for this on a normal launch — generated jars
+/// legitimately hash differently across environments — so the test is confined
+/// to what is unambiguous: a file with no bytes, or an archive with no
+/// end-of-central-directory record, cannot be a finished output.
+fn is_structurally_complete(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return false;
+    }
+
+    let is_archive = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jar") || e.eq_ignore_ascii_case("zip"));
+    if !is_archive {
+        return true;
+    }
+
+    has_zip_end_of_central_directory(path, metadata.len())
+}
+
+/// Scans the tail of `path` for the ZIP end-of-central-directory signature,
+/// which a complete archive always carries within its last 64KiB (22 bytes of
+/// record plus a comment of at most `u16::MAX`).
+fn has_zip_end_of_central_directory(path: &Path, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    const MAX_EOCD_SPAN: u64 = 22 + u16::MAX as u64;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let span = len.min(MAX_EOCD_SPAN);
+    if file.seek(SeekFrom::End(-(span as i64))).is_err() {
+        return false;
+    }
+    let mut tail = Vec::with_capacity(span as usize);
+    if file.take(span).read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    tail.windows(EOCD_SIGNATURE.len())
+        .any(|w| w == EOCD_SIGNATURE)
+}
+
 /// Returns the required files that are not on disk. With `verify_hashes`
 /// (deep-check / repair only), files whose known SHA-1 does not match are
 /// deleted and reported as missing so the caller regenerates them. Normal
@@ -139,6 +190,14 @@ pub async fn missing_files(required: &[RequiredFile], verify_hashes: bool) -> Ve
         let mut missing = Vec::new();
         for file in &owned {
             if !file.path.is_file() {
+                missing.push(file.path.clone());
+                continue;
+            }
+            if !is_structurally_complete(&file.path) {
+                tracing::info!(
+                    "Processor output is empty or truncated, regenerating: {:?}",
+                    file.path
+                );
                 missing.push(file.path.clone());
                 continue;
             }
@@ -194,6 +253,7 @@ fn hash_file_sha1(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     // Trimmed from the live meta.gdl.gg payload for forge 1.20.1-47.2.0
     // (classpath arrays emptied; irrelevant to resolution). Covers: a
@@ -387,10 +447,22 @@ mod tests {
         path
     }
 
+    /// End-of-central-directory record of an empty archive.
+    const EOCD: &[u8] =
+        b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
+    /// A structurally complete archive whose leading bytes callers vary to
+    /// control its hash.
+    fn write_jar(dir: &Path, rel: &str, body: &[u8]) -> PathBuf {
+        let mut contents = body.to_vec();
+        contents.extend_from_slice(EOCD);
+        write_file(dir, rel, &contents)
+    }
+
     #[tokio::test]
     async fn missing_files_reports_absent_and_keeps_present() {
         let dir = tempfile::tempdir().unwrap();
-        let present = write_file(dir.path(), "a/b/1/b-1.jar", b"hello");
+        let present = write_jar(dir.path(), "a/b/1/b-1.jar", b"hello");
         let absent = dir.path().join("a/c/1/c-1.jar");
 
         let required = vec![
@@ -410,13 +482,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_output_counts_as_missing_on_a_normal_launch() {
+        // A processor writes its target incrementally; an interruption after the
+        // file is created leaves a zero-byte jar at the path existence alone
+        // accepts, and the launch then fails with a missing-dependency error
+        // that never regenerates it.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = write_file(dir.path(), "a/b/1/b-1.jar", b"");
+        let required = vec![RequiredFile {
+            path: empty.clone(),
+            expected_sha1: None,
+        }];
+
+        assert_eq!(missing_files(&required, false).await, vec![empty]);
+    }
+
+    #[tokio::test]
+    async fn truncated_jar_counts_as_missing_on_a_normal_launch() {
+        // Non-empty but cut short: no end-of-central-directory record, so the
+        // JVM cannot open it as an archive.
+        let dir = tempfile::tempdir().unwrap();
+        let truncated = write_file(dir.path(), "a/b/1/b-1.jar", b"PK\x03\x04 partial...");
+        let required = vec![RequiredFile {
+            path: truncated.clone(),
+            expected_sha1: None,
+        }];
+
+        assert_eq!(missing_files(&required, false).await, vec![truncated]);
+    }
+
+    #[tokio::test]
+    async fn intact_jar_is_kept_on_a_normal_launch() {
+        // A minimal but valid archive: empty central directory + EOCD record.
+        let dir = tempfile::tempdir().unwrap();
+        let intact = write_jar(dir.path(), "a/b/1/b-1.jar", b"");
+        let required = vec![RequiredFile {
+            path: intact,
+            expected_sha1: None,
+        }];
+
+        assert!(missing_files(&required, false).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_jar_output_is_only_checked_for_emptiness() {
+        // Processors also emit plain files; only archives get the EOCD check.
+        let dir = tempfile::tempdir().unwrap();
+        let txt = write_file(dir.path(), "a/b/1/b-1.txt", b"not an archive");
+        let required = vec![RequiredFile {
+            path: txt,
+            expected_sha1: None,
+        }];
+
+        assert!(missing_files(&required, false).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn hash_mismatch_ignored_on_normal_launch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(dir.path(), "a/b/1/b-1.jar", b"wrong contents");
+        let path = write_jar(dir.path(), "a/b/1/b-1.jar", b"wrong contents");
         let required = vec![RequiredFile {
             path: path.clone(),
-            // SHA-1 of "hello"
-            expected_sha1: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into()),
+            // SHA-1 of a different archive
+            expected_sha1: Some("fe0d5cde59fd57282571f339e0a9aedd85dbfb54".into()),
         }];
 
         let missing = missing_files(&required, false).await;
@@ -427,18 +555,19 @@ mod tests {
     #[tokio::test]
     async fn deep_check_deletes_mismatched_and_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let bad = write_file(dir.path(), "a/b/1/b-1.jar", b"wrong contents");
-        let good = write_file(dir.path(), "a/g/1/g-1.jar", b"hello");
-        let unhashed = write_file(dir.path(), "a/u/1/u-1.jar", b"anything");
+        let bad = write_jar(dir.path(), "a/b/1/b-1.jar", b"wrong contents");
+        let good = write_jar(dir.path(), "a/g/1/g-1.jar", b"hello");
+        let unhashed = write_jar(dir.path(), "a/u/1/u-1.jar", b"anything");
 
         let required = vec![
             RequiredFile {
                 path: bad.clone(),
-                expected_sha1: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into()),
+                // SHA-1 of `good`, so `bad` mismatches.
+                expected_sha1: Some("fe0d5cde59fd57282571f339e0a9aedd85dbfb54".into()),
             },
             RequiredFile {
                 path: good.clone(),
-                expected_sha1: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into()),
+                expected_sha1: Some("fe0d5cde59fd57282571f339e0a9aedd85dbfb54".into()),
             },
             RequiredFile {
                 path: unhashed.clone(),
@@ -456,6 +585,150 @@ mod tests {
         assert!(
             unhashed.is_file(),
             "files without a known SHA are existence-checked only"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Golden cross-check against the TS port
+    // -----------------------------------------------------------------
+    //
+    // `required_files` is load-bearing production code (called from
+    // `managers/instance/run/minecraft.rs` to decide whether Forge/NeoForge
+    // processors need to re-run at launch), and the e2e suite
+    // (`apps/desktop/e2e-tests/loaderInstall.spec.ts`) carries an
+    // independent TypeScript port of it
+    // (`apps/desktop/e2e-tests/helpers/processorOutputs.ts`) so the
+    // processor-artifact assertion can run without a Rust binding into the
+    // Playwright process. Two independent implementations of the same
+    // logic drift silently unless something forces them to agree: this
+    // test computes `required_files`'s real output for a fixed, committed
+    // input fixture and compares it byte-for-byte against a committed
+    // golden output file; `processorOutputs.test.ts` reads the exact same
+    // two files (`../../../../crates/carbon_app/fixtures/processor_outputs_golden/`
+    // from its own location) and asserts its port produces the same
+    // (order-normalized) result. A behavior change here either breaks this
+    // test (if the golden wasn't regenerated) or, once the golden is
+    // deliberately regenerated to reflect an intended change, breaks the TS
+    // test until that port is updated to match — either way a human is
+    // told, rather than the two implementations quietly disagreeing while
+    // each individually keeps passing its own tests.
+    //
+    // `outputs` on `Processor` is a `HashMap`, so multiple entries in one
+    // processor's `outputs` map can be visited in different orders across
+    // runs — this normalizes that away by sorting on `relative_path` before
+    // serializing, on both sides, so the comparison is over the *set* of
+    // required files, not incidental Rust HashMap iteration order.
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct GoldenCase {
+        name: String,
+        processors: Vec<Processor>,
+        data: HashMap<String, SidedDataEntry>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    struct GoldenRequiredFile {
+        relative_path: String,
+        expected_sha1: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct GoldenOutputCase {
+        name: String,
+        required: Vec<GoldenRequiredFile>,
+    }
+
+    fn golden_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/processor_outputs_golden")
+    }
+
+    /// Converts `required_files`'s output to the portable golden shape:
+    /// forward-slash paths (Rust's own `PathBuf` join uses `\` on Windows,
+    /// which would make the committed golden file platform-dependent
+    /// otherwise — the TS port always produces `/`-joined paths when run on
+    /// Linux/macOS CI, and this keeps the comparison meaningful regardless
+    /// of which OS generated or reads the golden), sorted by path for the
+    /// HashMap-ordering reason above.
+    fn to_golden(required: &[RequiredFile]) -> Vec<GoldenRequiredFile> {
+        let mut out: Vec<GoldenRequiredFile> = required
+            .iter()
+            .map(|f| GoldenRequiredFile {
+                relative_path: f.path.to_string_lossy().replace('\\', "/"),
+                expected_sha1: f.expected_sha1.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        out
+    }
+
+    /// Computes `required_files` for every case in the committed input
+    /// fixture, in the same golden shape the committed output file stores.
+    fn compute_golden_output(cases: &[GoldenCase]) -> Vec<GoldenOutputCase> {
+        cases
+            .iter()
+            .map(|case| {
+                // `Path::new("")` mirrors `requiredLibraryPaths`'s TS side
+                // (which never joins a libraries root at all): joining onto
+                // an empty base leaves `RequiredFile::path` exactly the
+                // relative path, so nothing here needs to strip a prefix
+                // back off before comparing.
+                let required = required_files(&case.processors, Some(&case.data), Path::new(""));
+                GoldenOutputCase {
+                    name: case.name.clone(),
+                    required: to_golden(&required),
+                }
+            })
+            .collect()
+    }
+
+    /// Compares `required_files`'s real output against a committed golden
+    /// file (see the module-level comment above this test for why this
+    /// exists). Run with `UPDATE_GOLDEN_PROCESSOR_OUTPUTS=1` to regenerate
+    /// the golden after a deliberate behavior change — review the diff like
+    /// any other source change, and update `processorOutputs.test.ts`'s
+    /// port to match before committing it, since that test will otherwise
+    /// go red against the new golden.
+    #[test]
+    fn required_files_matches_committed_golden() {
+        let dir = golden_dir();
+        let input_path = dir.join("input.json");
+        let output_path = dir.join("output.json");
+
+        let input_json = std::fs::read_to_string(&input_path)
+            .unwrap_or_else(|e| panic!("failed to read golden input {input_path:?}: {e}"));
+        let cases: Vec<GoldenCase> = serde_json::from_str(&input_json)
+            .unwrap_or_else(|e| panic!("failed to parse golden input {input_path:?}: {e}"));
+        assert!(
+            !cases.is_empty(),
+            "golden input fixture {input_path:?} has no cases"
+        );
+
+        let computed = compute_golden_output(&cases);
+        let computed_json = serde_json::to_string_pretty(&computed).unwrap() + "\n";
+
+        if std::env::var_os("UPDATE_GOLDEN_PROCESSOR_OUTPUTS").is_some() {
+            std::fs::write(&output_path, &computed_json)
+                .unwrap_or_else(|e| panic!("failed to write golden output {output_path:?}: {e}"));
+            eprintln!("Regenerated golden output at {output_path:?}");
+            return;
+        }
+
+        let golden_json = std::fs::read_to_string(&output_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read committed golden output {output_path:?}: {e} \
+                 (run with UPDATE_GOLDEN_PROCESSOR_OUTPUTS=1 to generate it)"
+            )
+        });
+
+        assert_eq!(
+            computed_json, golden_json,
+            "required_files' output no longer matches the committed golden at \
+             {output_path:?}. If this is an intended behavior change: re-run with \
+             UPDATE_GOLDEN_PROCESSOR_OUTPUTS=1 cargo test -p carbon_app \
+             required_files_matches_committed_golden, review the diff, update \
+             apps/desktop/e2e-tests/helpers/processorOutputs.test.ts's port to \
+             match, and commit both together."
         );
     }
 }

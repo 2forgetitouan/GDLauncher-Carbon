@@ -1,6 +1,6 @@
 import { Button, Tooltip, TooltipContent, TooltipTrigger } from "@gd/ui"
 import { useLocation, useParams } from "@solidjs/router"
-import { Match, Show, Switch, createEffect, createMemo } from "solid-js"
+import { Match, Show, Switch, createMemo } from "solid-js"
 import { useGDNavigate } from "@/managers/NavigationManager"
 import { useModal } from "@/managers/ModalsManager"
 import { rspc } from "@/utils/rspcClient"
@@ -11,6 +11,7 @@ import { getServerImageUrl } from "@/utils/instances"
 import DetailPageLayout, {
   type DetailPageTab
 } from "@/pages/Library/shared/DetailPageLayout"
+import { useEntityGoneGuard } from "@/pages/Library/shared/useEntityGoneGuard"
 import { isConsoleFullScreen } from "./Tabs/ConsoleTab"
 
 interface ServerTab {
@@ -19,6 +20,11 @@ interface ServerTab {
   icon: string
   segment: string
 }
+
+// Mirrors CRASH_RESTART_MAX_ATTEMPTS in
+// crates/carbon_app/src/managers/server/mod.rs, which the backend does not
+// expose — only the resulting `autoRestartAbandoned` flag is sent over rspc.
+const AUTO_RESTART_MAX_ATTEMPTS = 6
 
 const ALL_TABS: ServerTab[] = [
   {
@@ -89,6 +95,7 @@ const Server = (props: { children?: any }) => {
   const isStopping = () => details()?.state?.status === "stopping"
   const isStopped = () => details()?.state?.status === "stopped"
   const isBusy = () => isStarting() || isStopping()
+  const isAutoRestartAbandoned = () => details()?.autoRestartAbandoned ?? false
 
   const handleStartStop = () => {
     if (isRunning()) {
@@ -119,16 +126,16 @@ const Server = (props: { children?: any }) => {
     navigator.navigate(path)
   }
 
-  // Navigate back if server was deleted
-  createEffect(() => {
-    if (
-      routeData.allServers.data &&
-      !routeData.allServers.data?.find(
-        (s: { id: number }) => s.id === serverId()
-      )
-    ) {
-      navigator.navigate("/library?mode=servers")
-    }
+  // Leaves the page when the server this route points at is gone — deleted
+  // from under the user, most often from another surface. Same hardened
+  // guard as Instance/index.tsx; see `useEntityGoneGuard` for why both the
+  // NaN-id and isFetching guards matter.
+  useEntityGoneGuard({
+    id: serverId,
+    list: () => routeData.allServers.data,
+    isFetching: () => routeData.allServers.isFetching,
+    matches: (server: { id: number }, id) => server.id === id,
+    redirectTo: "/library?mode=servers"
   })
 
   const tabs = (): DetailPageTab[] =>
@@ -216,6 +223,16 @@ const Server = (props: { children?: any }) => {
                   </Match>
                 </Switch>
               </div>
+              {/* Auto-restart gave up — surfaces until the next manual start */}
+              <Show when={isAutoRestartAbandoned()}>
+                <div class="flex items-center gap-1.5 text-xs font-medium text-yellow-500">
+                  <div class="i-hugeicons:alert-02 h-4 w-4 shrink-0" />
+                  <Trans
+                    key="instances:_trn_server_auto_restart_abandoned"
+                    options={{ count: AUTO_RESTART_MAX_ATTEMPTS }}
+                  />
+                </div>
+              </Show>
             </div>
           </div>
         </>
@@ -265,7 +282,7 @@ const Server = (props: { children?: any }) => {
                   disabled={!details()!.modpackInfo || !isStopped()}
                   onClick={() =>
                     modalsContext?.openModal(
-                      { name: "confirmReinstall" },
+                      { name: "repairModpack" },
                       {
                         id: serverId(),
                         name: details()!.name,
@@ -278,7 +295,7 @@ const Server = (props: { children?: any }) => {
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                <Trans key="instances:_trn_instance_settings.reinstall" />
+                <Trans key="instances:_trn_instance_settings.repair" />
               </TooltipContent>
             </Tooltip>
           </Show>

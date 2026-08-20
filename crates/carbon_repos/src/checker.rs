@@ -8,15 +8,20 @@
 //!
 //! - [`check_module`]: the SQL prepares (unknown tables/columns/syntax fail),
 //!   declared param names are exactly the statement's bound params (no extras,
-//!   none missing), a multi-param query never uses a positional `?`, and every
-//!   expected column appears in the result set.
+//!   none missing), no query uses a positional `?`, and every expected column
+//!   appears in the result set.
 //! - [`check_manifests`]: an authorizer records the write actions each statement
 //!   performs; a write to a freshness table must set that table's freshness
 //!   column.
 //! - [`check_nullability`]: each result column's origin is resolved via
 //!   `column_metadata`; a column whose source is nullable must be `Option`, and
 //!   an expression column with no resolvable origin must be `Option` or carry an
-//!   explicit `#[nullable(...)]` override.
+//!   explicit `#[nullable(...)]` override. It also catches the one case where a
+//!   `NOT NULL`-by-schema column must still be `Option`: sourced from a table
+//!   this query joins via an *unambiguous* `LEFT [OUTER] JOIN` (see
+//!   [`unambiguous_left_join_tables`] for exactly what that covers and does
+//!   not — a deliberately conservative, self-join-safe subset of general
+//!   outer-join nullability, not a full join-position analysis).
 //! - [`check_query_plans`]: `EXPLAIN QUERY PLAN` must not full-scan a guarded
 //!   hot cache table unless the query is explicitly allowlisted.
 //! - [`check_insert_datetime_columns`]: every registered `INSERT`'s explicit
@@ -85,12 +90,15 @@ pub fn check_module(conn: &Connection, queries: &[QueryCheck]) -> Vec<String> {
                 ));
             }
         }
-        // 3. multi-param queries must use named params (no bare '?'), scanning
-        // only outside string literals so a literal '?' in a text value is not
-        // mistaken for a positional placeholder.
+        // 3. every param must be named (no bare '?'), scanning only outside
+        // string literals so a literal '?' in a text value is not mistaken for a
+        // positional placeholder. The generated wrappers bind a name/value slice,
+        // which routes to rusqlite's named binding and never fills a positional
+        // slot — an unbound placeholder then reads as NULL rather than failing —
+        // so this holds however many named params the query also declares.
         // CENSUS-RULE: checker.positional-param
-        if q.params.len() > 1 && sql_has_positional_param(q.sql) {
-            violations.push(format!("{}: multi-param query uses positional '?'", q.name));
+        if sql_has_positional_param(q.sql) {
+            violations.push(format!("{}: query uses positional '?'", q.name));
         }
         // 4. result shape vs COLUMNS metadata
         if let Some(cols) = q.columns {
@@ -105,15 +113,106 @@ pub fn check_module(conn: &Connection, queries: &[QueryCheck]) -> Vec<String> {
                     ));
                 }
             }
+            // 5. duplicate result-column names (case-insensitive, matching
+            // rusqlite's own case-insensitive by-name column resolution): the
+            // generated `FromRow::from_row` reads every field by name, and
+            // that lookup resolves to the first matching column index — an
+            // unaliased join exposing two same-named columns (e.g. both sides
+            // having an `id`) silently binds the left one, with the right one
+            // never reachable by name despite appearing in the result set.
+            let mut seen: Vec<String> = Vec::new();
+            for name in &actual_cols {
+                let lower = name.to_ascii_lowercase();
+                // CENSUS-RULE: checker.duplicate-result-column
+                if seen.contains(&lower) {
+                    violations.push(format!(
+                        "{}: result set has a duplicate column name '{name}' (columns: \
+                         {actual_cols:?}) — FromRow's by-name lookup would silently bind \
+                         the first (left) one; alias one side of the join distinctly",
+                        q.name
+                    ));
+                } else {
+                    seen.push(lower);
+                }
+            }
         }
     }
     violations
 }
 
+/// Strips SQL `-- ...` line comments and `/* ... */` block comments from
+/// `sql`, replacing each with a single space (never nothing — `foo--bar`
+/// stripped to `foobar` would wrongly merge two tokens into one) so callers
+/// that tokenize or scan the result never mistake commented-out SQL for live
+/// SQL. Quote-aware: a `--` or `/*` inside a `'...'` string literal or a
+/// `"..."` / `` `...` `` / `[...]` quoted identifier is left untouched — a
+/// literal like `'a--b'` survives intact — matching the same span rules
+/// [`sql_tokens`] itself understands (`''` doubles an embedded quote inside a
+/// `'...'` string; the other quote kinds have no doubling here, same as
+/// `sql_tokens`'s own reader). Used by both [`sql_tokens`] and
+/// [`sql_has_positional_param`] so a comment can neither feed a phantom
+/// LEFT JOIN/table reference into the former nor trip a false positional-`?`
+/// hit in the latter.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                while let Some(n) = chars.next() {
+                    out.push(n);
+                    if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            out.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                out.push(c);
+                for n in chars.by_ref() {
+                    out.push(n);
+                    if n == close {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next(); // consume the second '-'
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume the '*'
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                out.push(' ');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// True when `sql` contains a positional `?` placeholder outside any string
-/// literal or quoted identifier. A tiny state machine skips `'...'` and `"..."`
-/// spans (SQLite doubles the quote to escape it) so a literal `?` inside a text
-/// value never reads as a placeholder.
+/// literal, quoted identifier, or SQL comment. Comments are stripped first
+/// (see [`strip_sql_comments`]) so a literal `?` inside a `-- ...` or
+/// `/* ... */` comment never reads as a placeholder. A tiny state machine then
+/// skips `'...'` and `"..."` spans (SQLite doubles the quote to escape it) so
+/// a literal `?` inside a text value doesn't either.
 fn sql_has_positional_param(sql: &str) -> bool {
     #[derive(PartialEq)]
     enum State {
@@ -121,6 +220,7 @@ fn sql_has_positional_param(sql: &str) -> bool {
         Single,
         Double,
     }
+    let sql = strip_sql_comments(sql);
     let mut state = State::Normal;
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
@@ -315,6 +415,42 @@ pub fn check_classification(conn: &Connection, queries: &[QueryCheck]) -> Vec<St
     violations
 }
 
+/// Pool-routing rule: every registered query's [`QueryCheck::routes_write`]
+/// must agree with its [`QueryCheck::class`] (`routes_write == (class ==
+/// Write)`).
+///
+/// `class` is derived from the SQL's leading verb; `routes_write` is a
+/// *second*, independently hard-coded fact — which `queries!` arm actually
+/// fired, since only the `usize`/`execute` arm routes to the writer and every
+/// row-returning arm (`Option<Row>`, `Vec<Row>`, `i64`, bare `Row`) routes to
+/// the read-only pool regardless of what the SQL does. The two facts agree for
+/// every query in this codebase today, but nothing stopped a future write
+/// declared through a row-returning arm (`UPDATE … RETURNING id -> i64`) from
+/// silently keying its runtime pool off the return-type shape rather than the
+/// SQL verb: `check_classification` above only catches a *misclassified*
+/// `class` (a `WITH`-wrapped write that lies about its own leading verb) — it
+/// is structurally blind to a *correctly*-classified `Write` query that was
+/// declared via a read-routing arm anyway, because that arm's `class_of($sql)`
+/// call computes `Write` right alongside the very `routes_write: false` that
+/// disagrees with it. This rule is the one place both facts are compared.
+pub fn check_pool_routing(queries: &[QueryCheck]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for q in queries {
+        let expected = q.class == QueryClass::Write;
+        // CENSUS-RULE: checker.routing-matches-class
+        if q.routes_write != expected {
+            violations.push(format!(
+                "{}: classified {:?} but routes_write is {} — a write declared through a \
+                 row-returning arm routes to the read-only pool and fails every call \
+                 (SQLITE_READONLY), while a read declared through the usize/execute arm \
+                 routes to the writer needlessly",
+                q.name, q.class, q.routes_write
+            ));
+        }
+    }
+    violations
+}
+
 /// Origin-based nullability lint. For every row-returning query, each expected
 /// column is matched to its result column and its origin resolved via
 /// `column_metadata`:
@@ -323,11 +459,19 @@ pub fn check_classification(conn: &Connection, queries: &[QueryCheck]) -> Vec<St
 ///   (`Option`), otherwise a NULL read panics at runtime;
 /// - a column with no resolvable origin (a SQL expression / aggregate) must be
 ///   declared nullable or carry an explicit `#[nullable(...)]` override, since
-///   its nullability can't be inferred.
+///   its nullability can't be inferred;
+/// - a column sourced from a table this query joins via an unambiguous `LEFT
+///   [OUTER] JOIN` must also be declared nullable, even when that table's own
+///   schema marks the column `NOT NULL` — see [`unambiguous_left_join_tables`]
+///   for exactly what "unambiguous" means and what is deliberately left
+///   uncovered.
 ///
-/// The source-NOT-NULL direction is intentionally not enforced: a LEFT JOIN can
-/// make a NOT-NULL source column NULL in the result, so declaring such a column
-/// `Option` is correct, not a violation.
+/// The source-NOT-NULL direction is intentionally not enforced *in general*: a
+/// LEFT JOIN can make a NOT-NULL source column NULL in the result, so
+/// declaring such a column `Option` is correct, not a violation. The
+/// unambiguous-LEFT-JOIN case above is the one exception where this rule does
+/// still enforce that direction, precisely because it can tell (from the SQL
+/// text) that the column's table sits on the optional side.
 pub fn check_nullability(conn: &Connection, queries: &[QueryCheck]) -> Vec<String> {
     let mut violations = Vec::new();
     for q in queries {
@@ -339,6 +483,7 @@ pub fn check_nullability(conn: &Connection, queries: &[QueryCheck]) -> Vec<Strin
             Ok(st) => st,
             Err(_) => continue,
         };
+        let left_join_tables = unambiguous_left_join_tables(q.sql);
         for spec in cols {
             // An explicit override takes the developer at their word.
             if spec.explicit_nullable {
@@ -350,12 +495,27 @@ pub fn check_nullability(conn: &Connection, queries: &[QueryCheck]) -> Vec<Strin
                 Err(_) => continue,
             };
             match st.column_metadata(idx) {
-                Ok(Some((_, _, _, _, _, not_null, _, _))) => {
+                Ok(Some((_, table_name, _, _, _, not_null, _, _))) => {
                     // CENSUS-RULE: checker.nullability-nullable-source
                     if !not_null && !spec.nullable {
                         violations.push(format!(
                             "{}: column '{}' maps a nullable source column but is declared non-null (use Option or #[nullable(true)])",
                             q.name, spec.name
+                        ));
+                    }
+                    // CENSUS-RULE: checker.nullability-outer-join-widening
+                    if !spec.nullable
+                        && left_join_tables
+                            .contains(&table_name.to_string_lossy().to_ascii_uppercase())
+                    {
+                        violations.push(format!(
+                            "{}: column '{}' is sourced from '{}', which this query LEFT JOINs — \
+                             an unmatched row makes it NULL regardless of that table's own \
+                             NOT NULL constraint; declare it Option or add an explicit \
+                             #[nullable(...)] override",
+                            q.name,
+                            spec.name,
+                            table_name.to_string_lossy()
                         ));
                     }
                 }
@@ -373,6 +533,145 @@ pub fn check_nullability(conn: &Connection, queries: &[QueryCheck]) -> Vec<Strin
         }
     }
     violations
+}
+
+/// The schema table names (upper-cased) this query joins via an *unambiguous*
+/// `LEFT [OUTER] JOIN`: introduced exactly once in the whole query, and that
+/// one introduction is a `LEFT`/`LEFT OUTER` join. Used by [`check_nullability`]
+/// to catch a `NOT NULL`-by-schema column widened to nullable purely by
+/// sitting on a LEFT JOIN's optional side — something `column_metadata` alone
+/// can never see, since SQLite reports a column's schema constraint, not its
+/// join position.
+///
+/// "Unambiguous" is deliberately conservative, trading recall for zero false
+/// positives:
+///
+/// - **Self-joins are skipped.** A table introduced more than once (`FROM Foo
+///   a LEFT JOIN Foo b ON …`) is dropped entirely: `column_metadata` reports
+///   the bare schema name ("Foo") with no way to tell which occurrence a given
+///   result column came from, so treating *any* occurrence as authoritative
+///   for *every* occurrence would flag the preserved side (`a`) as if it were
+///   the optional one (`b`).
+/// - **Only `LEFT`/`LEFT OUTER JOIN` is recognised.** A `RIGHT JOIN` (which
+///   widens the *preceding* tables instead) and a `FULL [OUTER] JOIN` (which
+///   widens both sides) are not detected — neither appears anywhere in this
+///   codebase's registered queries today, so the added complexity of tracking
+///   them is deferred rather than risking an incorrect implementation.
+/// - **No multi-hop propagation.** Only the table named directly after the
+///   `LEFT JOIN` keyword is considered widened. A further `INNER JOIN` chained
+///   onto that table's alias does not have its own widening modelled.
+/// - **Derived tables and CTEs resolve safely, not necessarily precisely.** A
+///   `LEFT JOIN (SELECT …) AS sub` has no bare identifier after `JOIN` (a `(`
+///   token instead), so it never matches a real schema table name — the
+///   heuristic silently does not apply rather than misfiring.
+/// - **Old-style comma joins count too.** `FROM a, b` introduces `b` exactly
+///   as an explicit `JOIN b` would; a comma seen while still inside a `FROM`
+///   clause's table list is treated as another occurrence, so a table also
+///   reached this way still correctly counts toward the ambiguity check
+///   below.
+///
+/// None of these gaps can produce a false positive; they can only make the
+/// rule miss a case, which is exactly the existing status quo this rule
+/// improves on rather than regresses.
+fn unambiguous_left_join_tables(sql: &str) -> std::collections::HashSet<String> {
+    // Keywords/punctuation that close a `FROM` clause's comma-separated table
+    // list once seen. `JOIN` itself is handled separately below (it starts its
+    // own explicit join rather than continuing a comma list); plain
+    // identifiers — bare table names, aliases, `AS` — never appear here, so
+    // they never terminate the list before its next comma.
+    const FROM_LIST_TERMINATORS: &[&str] = &[
+        "WHERE",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "GROUP",
+        "ORDER",
+        "LIMIT",
+        "HAVING",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "WINDOW",
+        "SET",
+        "VALUES",
+        "RETURNING",
+        ")",
+        ";",
+    ];
+
+    let tokens = sql_tokens(sql);
+    let mut occurrences: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seen_via_left_join: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut in_from_list = false;
+
+    for (i, tok) in tokens.iter().enumerate() {
+        let is_from = tok.eq_ignore_ascii_case("FROM");
+        let is_join = tok.eq_ignore_ascii_case("JOIN");
+        let is_from_list_comma = in_from_list && tok == ",";
+
+        if is_join {
+            in_from_list = false;
+        } else if is_from {
+            in_from_list = true;
+        } else if in_from_list
+            && FROM_LIST_TERMINATORS
+                .iter()
+                .any(|k| tok.eq_ignore_ascii_case(k))
+        {
+            in_from_list = false;
+        }
+
+        if !is_from && !is_join && !is_from_list_comma {
+            continue;
+        }
+        // A bare identifier must follow; a `(` (derived table) or anything
+        // else never matches a real schema table name later, so recording it
+        // is harmless, but only an identifier can ever actually match.
+        let Some(name) = tokens.get(i + 1) else {
+            continue;
+        };
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+        {
+            continue;
+        }
+        let key = name.to_ascii_uppercase();
+        *occurrences.entry(key.clone()).or_insert(0) += 1;
+
+        if is_join {
+            // Walk back over join-modifier keywords immediately preceding
+            // this `JOIN` to see whether `LEFT` (with an optional `OUTER`
+            // between it and `JOIN`) introduced it.
+            let mut j = i;
+            let mut is_left = false;
+            while j > 0 {
+                let prev = &tokens[j - 1];
+                if prev.eq_ignore_ascii_case("OUTER") {
+                    j -= 1;
+                    continue;
+                }
+                if prev.eq_ignore_ascii_case("LEFT") {
+                    is_left = true;
+                }
+                break;
+            }
+            if is_left {
+                seen_via_left_join.insert(key);
+            }
+        }
+    }
+
+    seen_via_left_join
+        .into_iter()
+        .filter(|name| occurrences.get(name) == Some(&1))
+        .collect()
 }
 
 /// Hot cache tables that must never be full-scanned by a registered query: a
@@ -432,10 +731,22 @@ pub fn check_query_plans(conn: &Connection, queries: &[QueryCheck]) -> Vec<Strin
             Ok(d) => d,
             Err(_) => continue,
         };
+        // The plan names whatever the FROM/JOIN clause bound the table to, so
+        // each guarded table is matched against its own name plus any alias the
+        // query gives it.
+        let guarded_names: Vec<(&str, Vec<String>)> = SCAN_GUARDED_TABLES
+            .iter()
+            .map(|table| {
+                let mut names = vec![(*table).to_string()];
+                names.extend(table_aliases(q.sql, table));
+                (*table, names)
+            })
+            .collect();
+
         for detail in &details {
-            for table in SCAN_GUARDED_TABLES {
+            for (table, names) in &guarded_names {
                 // CENSUS-RULE: checker.query-plan-full-scan
-                if plan_full_scans_table(detail, table) {
+                if names.iter().any(|n| plan_full_scans_table(detail, n)) {
                     violations.push(format!(
                         "{}: query plan full-scans guarded table '{}' ({}); add an index/PK filter or allowlist it",
                         q.name,
@@ -447,6 +758,132 @@ pub fn check_query_plans(conn: &Connection, queries: &[QueryCheck]) -> Vec<Strin
         }
     }
     violations
+}
+
+/// Splits `sql` into identifier and single-character punctuation tokens,
+/// unwrapping quoted identifiers and dropping string literals. Comments are
+/// stripped first (see [`strip_sql_comments`]), so `-- ...` / `/* ... */` text
+/// — including a commented-out `LEFT JOIN` or table reference — is never
+/// tokenized as live SQL. Enough structure to tell an alias from the keyword
+/// or punctuation that would otherwise follow a table name; not a SQL parser.
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let sql = strip_sql_comments(sql);
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                let mut ident = String::new();
+                for n in chars.by_ref() {
+                    if n == close {
+                        break;
+                    }
+                    ident.push(n);
+                }
+                out.push(ident);
+            }
+            '\'' => {
+                // Skip the literal; '' is an embedded quote, not a terminator.
+                while let Some(n) = chars.next() {
+                    if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                let mut ident = String::from(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' {
+                        ident.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(ident);
+            }
+            c if c.is_whitespace() => {}
+            other => out.push(other.to_string()),
+        }
+    }
+    out
+}
+
+/// Names `sql` binds `table` to, so a plan naming the alias is still recognised
+/// as scanning the guarded table. Only a bare or `AS`-introduced identifier
+/// directly after the table name counts; a keyword or punctuation there means
+/// the table was not aliased.
+fn table_aliases(sql: &str, table: &str) -> Vec<String> {
+    /// Words that may legally follow a table reference without being an alias.
+    const NOT_AN_ALIAS: &[&str] = &[
+        "AS",
+        "ON",
+        "USING",
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "LIMIT",
+        "OFFSET",
+        "HAVING",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "OUTER",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "SET",
+        "VALUES",
+        "RETURNING",
+        "WINDOW",
+        "AND",
+        "OR",
+        "NOT",
+        "SELECT",
+        "FROM",
+        "INDEXED",
+        "BY",
+        "WITH",
+    ];
+
+    let tokens = sql_tokens(sql);
+    let mut aliases = Vec::new();
+
+    for (i, token) in tokens.iter().enumerate() {
+        if !token.eq_ignore_ascii_case(table) {
+            continue;
+        }
+        let mut j = i + 1;
+        if tokens.get(j).is_some_and(|t| t.eq_ignore_ascii_case("AS")) {
+            j += 1;
+        }
+        let Some(candidate) = tokens.get(j) else {
+            continue;
+        };
+        let is_identifier = candidate
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_');
+        if is_identifier
+            && !NOT_AN_ALIAS
+                .iter()
+                .any(|k| candidate.eq_ignore_ascii_case(k))
+        {
+            aliases.push(candidate.clone());
+        }
+    }
+
+    aliases
 }
 
 /// True when an EQP `detail` line describes a full table scan of `table` — a
@@ -680,4 +1117,101 @@ pub fn check_handwritten_sql(files: &[(String, String)]) -> Vec<String> {
         }
     }
     violations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_sql_comments_strips_line_and_block_comments() {
+        let sql = "SELECT id -- old: LEFT JOIN X\n  FROM Foo /* inline note */ WHERE id = 1";
+        let stripped = strip_sql_comments(sql);
+        assert!(
+            !stripped.contains("LEFT JOIN X"),
+            "line comment text must be gone: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("inline note"),
+            "block comment text must be gone: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("FROM Foo"),
+            "live SQL must survive: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("WHERE id = 1"),
+            "live SQL after a mid-statement block comment must survive: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn strip_sql_comments_preserves_string_literals_containing_comment_markers() {
+        // A literal like 'a--b' or '/* not a comment */' must survive intact —
+        // the scan must not mistake a marker inside a string for a real
+        // comment start.
+        let sql = "SELECT 'a--b', '/* not a comment */' FROM Foo";
+        let stripped = strip_sql_comments(sql);
+        assert!(
+            stripped.contains("'a--b'"),
+            "a string literal containing '--' must be untouched: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("'/* not a comment */'"),
+            "a string literal containing '/*' must be untouched: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn sql_tokens_drops_a_commented_out_left_join() {
+        let sql = "-- old: LEFT JOIN Bar b ON b.id = Foo.id\nSELECT Foo.id FROM Foo";
+        let tokens = sql_tokens(sql);
+        assert!(
+            !tokens.iter().any(|t| t.eq_ignore_ascii_case("Bar")),
+            "a commented-out table reference must not be tokenized: {tokens:?}"
+        );
+        assert!(
+            !tokens.iter().any(|t| t.eq_ignore_ascii_case("LEFT")),
+            "a commented-out LEFT keyword must not be tokenized: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn unambiguous_left_join_tables_ignores_a_phantom_left_join_in_a_comment() {
+        // Before comment-stripping, this comment's "LEFT JOIN Bar" text alone
+        // tokenized as a real, unambiguous (occurring exactly once) LEFT JOIN
+        // of a table that never actually appears anywhere in the live SQL.
+        let sql = "-- old shape: LEFT JOIN Bar b ON b.foo_id = Foo.id\nSELECT Foo.id FROM Foo";
+        let widened = unambiguous_left_join_tables(sql);
+        assert!(
+            !widened.contains("BAR"),
+            "a LEFT JOIN mentioned only in a comment must not count: {widened:?}"
+        );
+    }
+
+    #[test]
+    fn unambiguous_left_join_tables_counts_comma_introduced_tables() {
+        // `Foo` is introduced twice: once by the old-style comma join in the
+        // FROM list, once by the explicit LEFT JOIN — genuinely ambiguous,
+        // like a self-join, and must be excluded from widening.
+        let sql = "SELECT Foo.label FROM Bar, Foo LEFT JOIN Foo f2 ON f2.id = Foo.parent_id";
+        let widened = unambiguous_left_join_tables(sql);
+        assert!(
+            !widened.contains("FOO"),
+            "a table introduced both by a comma join and a LEFT JOIN must be treated as \
+             ambiguous, not unambiguously widened: {widened:?}"
+        );
+    }
+
+    #[test]
+    fn sql_has_positional_param_ignores_a_question_mark_in_a_comment() {
+        assert!(
+            !sql_has_positional_param("SELECT id FROM Foo -- why?\nWHERE id = :id"),
+            "a '?' inside a line comment must not read as a positional placeholder"
+        );
+        assert!(
+            sql_has_positional_param("SELECT id FROM Foo WHERE id = ?"),
+            "a genuine bare '?' outside any comment or literal must still be caught"
+        );
+    }
 }

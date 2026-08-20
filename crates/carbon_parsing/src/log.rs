@@ -50,6 +50,8 @@ pub enum ParserError {
     Utf8Error(#[from] std::string::FromUtf8Error),
     #[error("Attribute error: {0}")]
     AttrError(#[from] quick_xml::events::attributes::AttrError),
+    #[error("event ended before its structure completed")]
+    UnexpectedEventEnd,
 }
 
 #[derive(Debug, PartialEq)]
@@ -71,6 +73,22 @@ impl LogParser {
             buffer: Vec::new(),
             partial_data: Vec::new(),
         }
+    }
+
+    /// Bytes currently buffered and not yet resolved into a [`ParsedItem`].
+    ///
+    /// Not needed to interpret `Ok` results -- those already say what
+    /// happened. It exists for callers that want to tell apart the two
+    /// shapes `Err` can take from [`Self::parse_next`]: most error paths
+    /// (e.g. a complete-but-unparseable `<log4j:Event>`) still advance the
+    /// buffer past the bad bytes before returning, so `buffered_len` drops;
+    /// a few (invalid UTF-8 or an unparseable XML entity in plain text
+    /// preceding any recognised tag) leave the buffer untouched, so
+    /// `buffered_len` stays the same and the identical error would recur on
+    /// an immediate retry -- a caller comparing this before and after can
+    /// tell the difference and only retry the former.
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
     }
 
     /// Feeds new data into the parser.
@@ -145,7 +163,87 @@ impl LogParser {
         Ok(entry)
     }
 
+    /// Parses a single `<log4j:Event>` element out of `data`, which the tag-balance
+    /// scan in `parse_next` has already confirmed spans exactly one complete
+    /// element (matched start/end tags, regardless of their names). Returns the
+    /// parsed entry, or the specific error that makes this event unparseable (bad
+    /// timestamp, empty logger, non-UTF8 message, missing `<log4j:Message>`).
+    ///
+    /// Callers must advance the real buffer past `data`'s length regardless of
+    /// the result: a bad event's bytes are a property of those bytes, not of how
+    /// much more data arrives later, so leaving them in the buffer would just
+    /// reproduce the same error on every future call.
+    fn parse_complete_event(data: &[u8]) -> Result<LogEntry, ParserError> {
+        let mut reader = Reader::from_reader(data);
+        reader.config_mut().check_end_names = false;
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
+
+        let start = match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(start)) if start.name().as_ref() == b"log4j:Event" => start,
+            // `data` is exactly the span the caller's tag-balance scan already
+            // confirmed opens with a `<log4j:Event>` start tag; reading the
+            // identical bytes again with the same reader config cannot disagree.
+            _ => return Err(ParserError::UnexpectedEventEnd),
+        };
+
+        let mut entry = Self::parse_attributes(&start)?;
+        let mut found_message = false;
+        let mut depth = 1;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => {
+                    depth += 1;
+                    if e.name().as_ref() == b"log4j:Message" {
+                        let mut message_buf = Vec::new();
+                        let mut message_complete = false;
+
+                        while !message_complete {
+                            match reader.read_event_into(&mut buf) {
+                                Ok(Event::Text(e)) => {
+                                    message_buf.extend_from_slice(&e.into_inner());
+                                }
+                                Ok(Event::CData(e)) => {
+                                    message_buf.extend_from_slice(&e.into_inner());
+                                }
+                                Ok(Event::End(ref e)) if e.name().as_ref() == b"log4j:Message" => {
+                                    message_complete = true;
+                                }
+                                Ok(Event::Eof) => return Err(ParserError::UnexpectedEventEnd),
+                                Err(e) => return Err(e.into()),
+                                _ => {}
+                            }
+                        }
+
+                        entry.message = String::from_utf8(message_buf)?;
+                        found_message = true;
+                        depth -= 1;
+                    }
+                }
+                Ok(Event::End(ref e)) => {
+                    depth -= 1;
+                    if depth == 0 && e.name().as_ref() == b"log4j:Event" {
+                        if found_message {
+                            return Ok(entry);
+                        }
+                        return Err(ParserError::MissingAttribute("message".to_string()));
+                    }
+                }
+                Ok(Event::Eof) => return Err(ParserError::UnexpectedEventEnd),
+                Err(e) => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+
     /// Attempts to parse the next item from the buffer.
+    ///
+    /// `Err` does not always mean the same thing about buffer progress: see
+    /// [`Self::buffered_len`] for how to tell a consumed-bad-event error
+    /// (safe to call again right away) from one that left the buffer
+    /// untouched (would just recur -- wait for more data instead, exactly
+    /// like `Ok(Some(ParsedItem::Partial(_)))`).
     pub fn parse_next(&mut self) -> Result<Option<ParsedItem>, ParserError> {
         if self.buffer.is_empty() {
             return Ok(None);
@@ -157,8 +255,16 @@ impl LogParser {
             return Ok(None);
         }
 
-        // First try to find a complete log4j:Event
-        let is_complete_log4j = {
+        // First try to find a complete log4j:Event, recording exactly how many
+        // bytes (from the start of the buffer) it spans so the buffer can always
+        // be advanced past it below, regardless of whether the detailed
+        // `parse_complete_event` pass further down succeeds. Without this, a
+        // complete-but-unparseable event (bad timestamp, empty logger, non-UTF8
+        // message, missing <log4j:Message>) would error out of `parse_next`
+        // before the buffer was ever drained, so the same bytes would be
+        // re-read and re-error on every future call: the live log freezes and
+        // the buffer grows without bound for the rest of the session.
+        let complete_event_len: Option<usize> = {
             let mut reader = Reader::from_reader(&self.buffer[..]);
             reader.config_mut().check_end_names = false;
             reader.config_mut().trim_text(false);
@@ -173,9 +279,9 @@ impl LogParser {
                             self.buffer.drain(..consumed as usize);
                             return self.parse_next();
                         }
-                        false
+                        None
                     } else {
-                        false
+                        None
                     }
                 }
                 Ok(Event::Start(ref e)) if e.name().as_ref() == b"log4j:Event" => {
@@ -191,90 +297,31 @@ impl LogParser {
                             _ => {}
                         }
                     }
-                    depth == 0
+                    (depth == 0).then(|| reader.buffer_position() as usize)
                 }
-                _ => false,
+                _ => None,
             }
         };
 
-        if is_complete_log4j {
-            let mut reader = Reader::from_reader(&self.buffer[..]);
-            reader.config_mut().check_end_names = false;
-            reader.config_mut().trim_text(false);
-            let mut buf = Vec::new();
+        if let Some(event_len) = complete_event_len {
+            let result = Self::parse_complete_event(&self.buffer[..event_len]);
 
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() == b"log4j:Event" => {
-                    let mut entry = Self::parse_attributes(e)?;
-                    let mut found_message = false;
-                    let mut depth = 1;
-
-                    loop {
-                        match reader.read_event_into(&mut buf) {
-                            Ok(Event::Start(ref e)) => {
-                                depth += 1;
-                                if e.name().as_ref() == b"log4j:Message" {
-                                    let mut message_buf = Vec::new();
-                                    let mut message_complete = false;
-
-                                    while !message_complete {
-                                        match reader.read_event_into(&mut buf) {
-                                            Ok(Event::Text(e)) => {
-                                                message_buf.extend_from_slice(&e.into_inner());
-                                            }
-                                            Ok(Event::CData(e)) => {
-                                                message_buf.extend_from_slice(&e.into_inner());
-                                            }
-                                            Ok(Event::End(ref e))
-                                                if e.name().as_ref() == b"log4j:Message" =>
-                                            {
-                                                message_complete = true;
-                                            }
-                                            Ok(Event::Eof) => return Ok(None),
-                                            Err(_) => return Ok(None),
-                                            _ => {}
-                                        }
-                                    }
-
-                                    entry.message = String::from_utf8(message_buf)?;
-                                    found_message = true;
-                                    depth -= 1;
-                                }
-                            }
-                            Ok(Event::End(ref e)) => {
-                                depth -= 1;
-                                if depth == 0 && e.name().as_ref() == b"log4j:Event" {
-                                    if found_message {
-                                        let consumed = reader.buffer_position();
-                                        if consumed > 0 && consumed <= self.buffer.len() as u64 {
-                                            self.buffer = self.buffer[consumed as usize..].to_vec();
-                                            // Skip any pure whitespace after the event
-                                            while !self.buffer.is_empty()
-                                                && self
-                                                    .buffer
-                                                    .iter()
-                                                    .take_while(|&&c| c.is_ascii_whitespace())
-                                                    .count()
-                                                    == self.buffer.len()
-                                            {
-                                                self.buffer.clear();
-                                            }
-                                        }
-                                        return Ok(Some(ParsedItem::LogEntry(entry)));
-                                    }
-                                    return Err(ParserError::MissingAttribute(
-                                        "message".to_string(),
-                                    ));
-                                }
-                            }
-                            Ok(Event::Eof) => return Ok(None),
-                            Err(_) => return Ok(None),
-                            _ => {}
-                        }
-                    }
-                }
-                _ => unreachable!("We already verified this was a log4j:Event"),
+            // This event's bytes are fully consumed either way -- see the doc
+            // comment on `parse_complete_event` for why an error must still drain.
+            self.buffer.drain(..event_len);
+            // Skip any pure whitespace after the event
+            while !self.buffer.is_empty()
+                && self
+                    .buffer
+                    .iter()
+                    .take_while(|&&c| c.is_ascii_whitespace())
+                    .count()
+                    == self.buffer.len()
+            {
+                self.buffer.clear();
             }
+
+            result.map(|entry| Some(ParsedItem::LogEntry(entry)))
         } else {
             // Check if what we have could be a start of a log4j event
             if is_potential_log4j_start(&self.buffer) {

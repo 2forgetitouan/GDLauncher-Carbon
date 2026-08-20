@@ -1,4 +1,4 @@
-//! Self-test census (spec §12 T11): the fence that fence-tests the fences.
+//! Self-test census: the fence that fence-tests the fences.
 //!
 //! Every mechanical enforcement rule in the data layer — the query checker's
 //! structural checks, its authorizer-driven lints, the bidirectional runner's
@@ -37,7 +37,7 @@ const SELFTEST_MARKER: &str = "CENSUS-SELFTEST:";
 /// Source files whose enforcement rules the census governs: the checker + its
 /// lints, the bidirectional runner's verifier/refusals, and the migration
 /// generator's derivations. (The foreign-key sweep in `fk.rs` is verified by its
-/// own behavioral + fallback tests under CI T10 and its bidirectional
+/// own behavioral + fallback tests and its bidirectional
 /// edge-list-completeness invariant; it is not part of this planted-failure
 /// census.)
 const RULE_SOURCE_FILES: &[&str] = &[
@@ -58,21 +58,25 @@ const EXPECTED_RULES: &[&str] = &[
     "checker.undeclared-param",
     "checker.positional-param",
     "checker.result-column-present",
+    "checker.duplicate-result-column",
     // Query checker authorizer-driven lints.
     "checker.freshness",
     "checker.nullability-nullable-source",
     "checker.nullability-expression-origin",
+    "checker.nullability-outer-join-widening",
     "checker.query-plan-full-scan",
     "checker.handwritten-sql-registered",
     "checker.insert-datetime-explicit",
     "checker.sql-ascii-leading",
     "checker.read-class-no-writes",
+    "checker.routing-matches-class",
     // Bidirectional runner verifier + refusals (compat.rs).
     "compat.diverged-checksum",
     "compat.backwards-missing-metadata",
     "compat.downgrade-corrupt-down",
     "compat.downgrade-schema-mismatch",
     "compat.downgrade-breaking-no-down",
+    "compat.downgrade-checkpoint-busy",
     // Migration generator down derivation (downgen.rs).
     "downgen.round-trip",
     "downgen.rename-flag",

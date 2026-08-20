@@ -11,8 +11,24 @@ import type { PlaywrightTestConfig } from "@playwright/test"
  */
 const config: PlaywrightTestConfig = {
   testDir: "./e2e-tests",
-  /* Maximum time one test can run for. */
-  timeout: 30 * 1000,
+  /* `e2e-tests/` also holds vitest unit specs (`*.test.ts`), which import
+     vitest's `expect`. Playwright's default testMatch would collect those
+     files too, and the two `expect` implementations collide defining the
+     same `$$jest-matchers-object` global, aborting collection before any
+     test runs — so this narrows collection to Playwright specs only. */
+  testMatch: "**/*.spec.ts",
+  /* Resolves the seeded version matrix once per run and hands it to workers
+     via process.env — see e2e-tests/globalSetup.ts. */
+  globalSetup: "./e2e-tests/globalSetup.ts",
+  /* Maximum time one test *body* can run for. A full install-and-launch
+     against a real version can legitimately take most of this; 15 minutes
+     is the project's hard ceiling for a single test. Fixture setup is
+     budgeted separately — see e2e-tests/fixtures/index.ts. */
+  timeout: 15 * 60 * 1000,
+  /* Backstop for the whole run: worst case is one 15-minute test per matrix
+     entry plus the login fixtures. This is what stops a wedged run holding
+     a CI runner indefinitely. */
+  globalTimeout: 3 * 60 * 60 * 1000,
   expect: {
     /**
      * Maximum time expect() should wait for the condition to be met.
@@ -24,16 +40,52 @@ const config: PlaywrightTestConfig = {
   fullyParallel: false,
   /* Fail the build on CI if you accidentally left test.only in the source code. */
   forbidOnly: !!process.env.CI,
-  /* Retry on CI only */
+  /* Never retry, deliberately — including on CI.
+     This suite drives real services: meta.gdl.gg, Mojang's CDNs, CurseForge
+     and Modrinth. An outage or a throttle there breaking the build is the
+     signal we are paying for, not noise to be absorbed: the CurseForge CDN
+     once began requiring an API key and broke every shipped client, which is
+     exactly the class of failure these tests exist to catch. Retrying would
+     convert that into a slower green run.
+     A red build from a third-party flake is the accepted cost. Investigate
+     it, or re-run it by hand — do not raise this number. */
   retries: 0,
-  /* Opt out of parallel tests on CI. */
-  workers: process.env.CI ? 1 : undefined,
+  /* One worker everywhere, and this is a correctness setting rather than a
+     performance one — do not make it conditional.
+
+     Two independent reasons. First, the suite's ordering invariants assume
+     it: `fixtures/installedInstance.ts` documents three load-bearing
+     dependencies that hold only because Playwright runs spec files in
+     alphabetical order through a single worker. Spread the files across
+     workers and each gets its own runtime path in its own order, so those
+     guarantees quietly stop applying — the assertions they protect still
+     run, and still pass, while no longer proving what they were written to
+     prove.
+
+     Second, every test here drives a real launcher against real CDNs. N
+     workers means N packaged apps concurrently downloading Minecraft assets,
+     JREs, libraries and mods. Measured on a 32-core host, where Playwright's
+     default picked 9: three failures, all of them saturation
+     (`UnknownHostException` thrown from inside a spawned Forge processor
+     JVM, and a failed JRE download) — versus a fully green run serialized.
+     It is not even a speed trade: 6.5 minutes at one worker against 4.8 at
+     nine, because the contention costs back most of what the parallelism
+     wins. */
+  workers: 1,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
   reporter: "html",
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
-    /* Maximum time each action such as `click()` can take. Defaults to 0 (no limit). */
-    actionTimeout: 0,
+    /* Maximum time each action such as `click()` can take. Bounded rather
+       than the 0 (no limit) default: with a 15-minute test timeout, an
+       unbounded action on a missing anchor hangs for the full 15 minutes and
+       is then abandoned by Playwright without running its `finally` —
+       leaving the creation modal open over the shared worker-scoped app, so
+       every remaining matrix entry hangs too. 60s is comfortably above the
+       explicit waits already used for slow anchors (e.g. `dismissStartupModals`'s
+       60s waits in fixtures/login.ts) while still failing fast on a genuinely
+       missing one. */
+    actionTimeout: 60_000,
     /* Base URL to use in actions like `await page.goto('/')`. */
     // baseURL: 'http://localhost:3000',
 

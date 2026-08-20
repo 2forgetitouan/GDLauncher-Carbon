@@ -45,6 +45,7 @@ use self::{enroll::EnrollmentTask, skin::SkinManager};
 use super::{AppInner, AppRef, ManagerRef};
 
 pub mod api;
+pub mod endpoints;
 mod enroll;
 pub mod gdl_account;
 mod oauth_server;
@@ -2195,8 +2196,6 @@ fn is_jwt_expired(token: &str) -> bool {
 
     (exp as i64) <= deadline
 }
-
-// get_gdl_auth_token removed — replaced by ensure_gdl_auth_token on ManagerRef
 
 /*impl From<FullAccount> for db::account::Data {
     fn from(value: FullAccount) -> Self {

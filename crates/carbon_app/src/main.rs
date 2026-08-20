@@ -100,7 +100,16 @@ pub fn main() {
             let runtime_path = runtime_path_override::get_runtime_path_override().await;
             let base_api_override = base_api_override::get_base_api_override();
 
-            let _guard = logger::setup_logger(&runtime_path).await;
+            logger::setup_logger(&runtime_path).await;
+            // After the logger so a panic anywhere below this point flushes
+            // the release-build file log before unwinding past it — see
+            // `logger::install_panic_hook`'s own doc comment for why a
+            // static `WorkerGuard` needs this at all.
+            logger::install_panic_hook();
+
+            // After the logger so its `E2E MODE` warnings land somewhere: with
+            // no subscriber installed yet, `tracing::warn!` is a silent no-op.
+            managers::account::endpoints::init_from_args();
 
             // Clean up leftover temp files/folders from previous sessions
             let temp_path = carbon_rt_path::TempPath::new(runtime_path.join("temp"));
@@ -132,6 +141,34 @@ pub fn main() {
 
             start_router(runtime_path, base_api_override, listener).await;
         });
+}
+
+/// Waits for a request to terminate this process: SIGTERM or SIGINT on
+/// unix (an external `kill`, Ctrl+C, or a service manager's stop signal),
+/// or Ctrl+C everywhere else.
+///
+/// This does NOT observe Windows' `TerminateProcess` — that is how
+/// Electron actually kills the core on Windows, and it is not a catchable
+/// signal on that platform. Orphaned server JVMs from that path are instead
+/// cleaned up on the next launch by the pidfile check in
+/// `ServerManager::load_servers`.
+#[cfg(unix)]
+async fn wait_for_termination_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install a SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install a SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn get_available_port() -> TcpListener {
@@ -207,9 +244,27 @@ async fn start_router(runtime_path: PathBuf, base_api_override: String, listener
 
     // Re-exchange GDL tokens on every startup to ensure they're valid
     // (handles backend target changes where JWT signing keys differ)
+    //
+    // Bounded so a stalled connection can't block `axum::serve` forever: generous
+    // enough for the HTTP client's own timeout/retries to get through a handful of
+    // accounts, but finite. Any account left un-refreshed when this times out is
+    // simply refreshed later, on demand, by `ensure_gdl_auth_token`, so a timeout
+    // here is handled exactly like the existing error path: log and move on.
+    const REFRESH_GDL_TOKENS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     let t = std::time::Instant::now();
-    if let Err(e) = app.account_manager().refresh_all_gdl_tokens().await {
-        tracing::warn!("Failed to refresh GDL tokens on startup: {}", e);
+    match tokio::time::timeout(
+        REFRESH_GDL_TOKENS_TIMEOUT,
+        app.account_manager().refresh_all_gdl_tokens(),
+    )
+    .await
+    {
+        Ok(Err(e)) => tracing::warn!("Failed to refresh GDL tokens on startup: {}", e),
+        Err(_) => tracing::warn!(
+            "Timed out after {:?} refreshing GDL tokens on startup",
+            REFRESH_GDL_TOKENS_TIMEOUT
+        ),
+        Ok(Ok(())) => {}
     }
     debug!(
         "[startup-timing] refresh_all_gdl_tokens completed in {:.2}s",
@@ -263,6 +318,33 @@ async fn start_router(runtime_path: PathBuf, base_api_override: String, listener
         "[startup-timing] reached axum::serve in {:.2}s total",
         startup_total.elapsed().as_secs_f64()
     );
+
+    // Graceful shutdown on external termination: without this, a running
+    // server's JVM is orphaned whenever this core process is killed instead
+    // of exiting through its own request handling (an external `kill`,
+    // Ctrl+C while running `pnpm watch:core`, or Electron's normal-quit
+    // path).
+    //
+    // Servers only, deliberately. A local server is infrastructure the
+    // launcher hosts, so it stops with the launcher; a *game* is the user's
+    // session, and closing the launcher mid-game does not end it. A game
+    // that outlives this process is recorded in its instance's pidfile and
+    // picked back up by the next startup's reconciliation
+    // (`InstanceManager::scan_instances`).
+    //
+    // `shutdown_running` bounds itself to ~3s, so this task always resolves
+    // and exits well inside the ~5s Electron waits before force killing the
+    // core.
+    tokio::spawn(async move {
+        wait_for_termination_signal().await;
+        info!("Termination signal received, shutting down running servers before exit");
+        app2.server_manager().shutdown_running().await;
+        // Through `flush_and_exit` rather than a bare `std::process::exit`
+        // so the `info!` line just above reaches disk before the process
+        // dies, the same reasoning as the fatal-DB-error exit in
+        // `managers/mod.rs`.
+        logger::flush_and_exit(0);
+    });
 
     // As soon as the server is ready, notify via stdout
     tokio::spawn(async move {

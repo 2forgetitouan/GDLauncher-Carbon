@@ -119,9 +119,29 @@ pub(super) fn mount() -> RouterBuilder<App> {
                 .map(FETaskId::from)
         }
 
-        mutation REINSTALL_MODPACK[app, id: FEInstanceId] {
+        mutation REPAIR_MODPACK[app, args: RepairModpack] {
             app.instance_manager()
-                .reinstall_modpack(id.into())
+                .repair_modpack(
+                    args.instance.into(),
+                    manager::modpack::RepairMarkerFile {
+                        re_enable_disabled: args.re_enable_disabled,
+                        cleanup_paths: args.cleanup_paths,
+                    },
+                )
+                .await
+                .map(FETaskId::from)
+        }
+
+        query GET_REPAIR_PREVIEW[app, args: RepairPreviewArgs] {
+            app.instance_manager()
+                .repair_preview(args.instance.into())
+                .await
+                .map(FERepairPreview::from)
+        }
+
+        mutation CHECK_PACK_ORIGIN[app, id: FEInstanceId] {
+            app.instance_manager()
+                .check_pack_origin(id.into())
                 .await
                 .map(FETaskId::from)
         }
@@ -1166,6 +1186,290 @@ struct ChangeModpack {
     modpack: Modpack,
 }
 
+#[derive(Type, Debug, Deserialize)]
+struct RepairModpack {
+    instance: FEInstanceId,
+    /// User-ticked untracked paths from the repair preview
+    /// (`RepairModpack/index.tsx`'s `ticked()` set) — packinfo-style keys,
+    /// empty when the user ticked nothing.
+    cleanup_paths: Vec<String>,
+    re_enable_disabled: bool,
+}
+
+#[derive(Type, Debug, Deserialize)]
+struct RepairPreviewArgs {
+    instance: FEInstanceId,
+}
+
+/// Result of [`GET_REPAIR_PREVIEW`](keys::instance::GET_REPAIR_PREVIEW): what
+/// [`manager::modpack::ManagerRef::repair_preview`] would do, computed
+/// read-only against the recorded `packinfo.json` — never the network. See
+/// that function's own docs for the preview/execution asymmetry this
+/// implies. `with_re_enable`/`without_re_enable` carry both
+/// `re_enable_disabled` outcomes over the one disk scan the query performs —
+/// `RepairModpack/index.tsx` picks between them client-side as its checkbox
+/// is toggled, so a query keyed only on `instance` never needs to re-fetch
+/// for that.
+#[derive(Type, Debug, Serialize)]
+pub struct FERepairPreview {
+    pub has_packinfo: bool,
+    pub with_re_enable: FERepairPlanVariant,
+    pub without_re_enable: FERepairPlanVariant,
+    pub untracked: Vec<FEUntrackedFile>,
+    pub duplicates: Vec<FEDuplicateGroup>,
+}
+
+impl From<manager::modpack::RepairPreview> for FERepairPreview {
+    fn from(value: manager::modpack::RepairPreview) -> Self {
+        Self {
+            has_packinfo: value.has_packinfo,
+            with_re_enable: value.with_re_enable.into(),
+            without_re_enable: value.without_re_enable.into(),
+            untracked: value
+                .untracked
+                .into_iter()
+                .map(FEUntrackedFile::from)
+                .collect(),
+            duplicates: value
+                .duplicates
+                .into_iter()
+                .map(FEDuplicateGroup::from)
+                .collect(),
+        }
+    }
+}
+
+/// One `re_enable_disabled` setting's worth of [`FERepairPreview`] — see
+/// [`manager::modpack::RepairPlanVariant`].
+#[derive(Type, Debug, Serialize)]
+pub struct FERepairPlanVariant {
+    /// Full expandable list, path-sorted.
+    pub entries: Vec<FERepairEntry>,
+    pub counts: FERepairCounts,
+}
+
+impl From<manager::modpack::RepairPlanVariant> for FERepairPlanVariant {
+    fn from(value: manager::modpack::RepairPlanVariant) -> Self {
+        Self {
+            entries: value.entries.into_iter().map(FERepairEntry::from).collect(),
+            counts: value.counts.into(),
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub struct FERepairEntry {
+    pub path: String,
+    pub action: FERepairAction,
+    pub reason: FERepairReason,
+}
+
+impl From<manager::modpack::apply_plan::PlanEntry> for FERepairEntry {
+    fn from(value: manager::modpack::apply_plan::PlanEntry) -> Self {
+        Self {
+            path: value.path,
+            action: value.action.into(),
+            reason: value.reason.into(),
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub enum FERepairAction {
+    Replace,
+    Create,
+    Delete,
+    Keep,
+    ReplaceDisabled,
+    ReEnable,
+}
+
+impl From<manager::modpack::apply_plan::PlanAction> for FERepairAction {
+    fn from(value: manager::modpack::apply_plan::PlanAction) -> Self {
+        use manager::modpack::apply_plan::PlanAction;
+        match value {
+            PlanAction::Replace => Self::Replace,
+            PlanAction::Create => Self::Create,
+            PlanAction::Delete => Self::Delete,
+            PlanAction::Keep => Self::Keep,
+            PlanAction::ReplaceDisabled => Self::ReplaceDisabled,
+            PlanAction::ReEnable => Self::ReEnable,
+        }
+    }
+}
+
+/// Mirrors `apply_plan::PlanReason` but without its per-variant hash payload
+/// — the preview surfaces only which bucket a path fell into, not the raw
+/// md5 diff.
+#[derive(Type, Debug, Serialize)]
+pub enum FERepairReason {
+    PackUpdate,
+    Unchanged,
+    ModifiedByUser,
+    DeletedByUser,
+    DisabledByUser,
+    InSaveFolder,
+    PackDropped,
+    DroppedButModified,
+    PreservedExisting,
+    RepairOverwrote,
+    RepairRestored,
+    ReEnabled,
+    CaseAliasedByTarget,
+    /// VersionChange-only — repair (the only mode this FE type is ever
+    /// actually populated from) never produces it, but `PlanReason` is one
+    /// enum shared by both modes, so this arm still has to exist.
+    DisabledReplaceResumed,
+}
+
+impl From<manager::modpack::apply_plan::PlanReason> for FERepairReason {
+    fn from(value: manager::modpack::apply_plan::PlanReason) -> Self {
+        use manager::modpack::apply_plan::PlanReason;
+        match value {
+            PlanReason::PackUpdate => Self::PackUpdate,
+            PlanReason::Unchanged => Self::Unchanged,
+            PlanReason::ModifiedByUser { .. } => Self::ModifiedByUser,
+            PlanReason::DeletedByUser => Self::DeletedByUser,
+            PlanReason::DisabledByUser => Self::DisabledByUser,
+            PlanReason::InSaveFolder => Self::InSaveFolder,
+            PlanReason::PackDropped => Self::PackDropped,
+            PlanReason::DroppedButModified { .. } => Self::DroppedButModified,
+            PlanReason::PreservedExisting => Self::PreservedExisting,
+            PlanReason::RepairOverwrote { .. } => Self::RepairOverwrote,
+            PlanReason::RepairRestored => Self::RepairRestored,
+            PlanReason::ReEnabled => Self::ReEnabled,
+            PlanReason::CaseAliasedByTarget { .. } => Self::CaseAliasedByTarget,
+            PlanReason::DisabledReplaceResumed => Self::DisabledReplaceResumed,
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub struct FERepairCounts {
+    pub restore_modified: u32,
+    pub restore_deleted: u32,
+    pub unchanged: u32,
+    pub disabled_kept: u32,
+    pub re_enabled: u32,
+    pub stale_dropped: u32,
+    pub saves_skipped: u32,
+}
+
+impl From<manager::modpack::RepairCounts> for FERepairCounts {
+    fn from(value: manager::modpack::RepairCounts) -> Self {
+        Self {
+            restore_modified: value.restore_modified,
+            restore_deleted: value.restore_deleted,
+            unchanged: value.unchanged,
+            disabled_kept: value.disabled_kept,
+            re_enabled: value.re_enabled,
+            stale_dropped: value.stale_dropped,
+            saves_skipped: value.saves_skipped,
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub struct FEUntrackedFile {
+    pub path: String,
+    /// `u64` doesn't map cleanly through specta — same `f64` pattern
+    /// `Mod::file_size` uses above.
+    pub size: f64,
+    pub label: FEUntrackedLabel,
+    /// Whether ticking this path for cleanup would actually remove it —
+    /// see `manager::modpack::UntrackedFile::deletable`. Always `true` for
+    /// `Unknown`; for `DisabledPackFile` this depends on whether the
+    /// tracked path's enabled copy still coexists on disk.
+    pub deletable: bool,
+    pub origin: Option<FEOriginVerdict>,
+}
+
+impl From<manager::modpack::UntrackedFile> for FEUntrackedFile {
+    fn from(value: manager::modpack::UntrackedFile) -> Self {
+        Self {
+            path: value.path,
+            size: value.size as f64,
+            label: value.label.into(),
+            deletable: value.deletable,
+            origin: value.origin.map(FEOriginVerdict::from),
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub enum FEUntrackedLabel {
+    Unknown,
+    DisabledPackFile,
+}
+
+impl From<manager::modpack::UntrackedLabel> for FEUntrackedLabel {
+    fn from(value: manager::modpack::UntrackedLabel) -> Self {
+        match value {
+            manager::modpack::UntrackedLabel::Unknown => Self::Unknown,
+            manager::modpack::UntrackedLabel::DisabledPackFile => Self::DisabledPackFile,
+        }
+    }
+}
+
+/// Populated once `instance.checkPackOrigin` has completed a run for the
+/// instance — `None` on an untracked file until then, or if that run never
+/// assigned this exact path a verdict. See `manager::modpack::origin_verdict_for`.
+#[derive(Type, Debug, Serialize)]
+pub enum FEOriginVerdict {
+    ShippedIn {
+        version_name: String,
+        version_id: String,
+    },
+    CurrentVersion,
+    Unknown,
+}
+
+impl From<manager::modpack::OriginVerdict> for FEOriginVerdict {
+    fn from(value: manager::modpack::OriginVerdict) -> Self {
+        match value {
+            manager::modpack::OriginVerdict::ShippedIn {
+                version_name,
+                version_id,
+            } => Self::ShippedIn {
+                version_name,
+                version_id,
+            },
+            manager::modpack::OriginVerdict::CurrentVersion => Self::CurrentVersion,
+            manager::modpack::OriginVerdict::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub struct FEDuplicateGroup {
+    pub modid: String,
+    pub files: Vec<FEDuplicateSide>,
+}
+
+impl From<manager::modpack::DuplicateGroup> for FEDuplicateGroup {
+    fn from(value: manager::modpack::DuplicateGroup) -> Self {
+        Self {
+            modid: value.modid,
+            files: value.files.into_iter().map(FEDuplicateSide::from).collect(),
+        }
+    }
+}
+
+#[derive(Type, Debug, Serialize)]
+pub struct FEDuplicateSide {
+    pub path: String,
+    pub pack_owned: bool,
+}
+
+impl From<manager::modpack::DuplicateSide> for FEDuplicateSide {
+    fn from(value: manager::modpack::DuplicateSide) -> Self {
+        Self {
+            path: value.path,
+            pack_owned: value.pack_owned,
+        }
+    }
+}
+
 #[derive(Type, Debug, Deserialize, Serialize)]
 enum FEJavaOverride {
     Profile(Option<String>),
@@ -1469,6 +1773,7 @@ struct InstanceDetails {
     modloaders: Vec<ModLoader>,
     java_override: Option<FEJavaOverride>,
     required_java_profile: Option<String>,
+    java_override_mismatch: bool,
     pre_launch_hook: Option<String>,
     post_exit_hook: Option<String>,
     wrapper_command: Option<String>,
@@ -1556,7 +1861,12 @@ enum LaunchState {
     Preparing(FETaskId),
     Running {
         start_time: DateTime<Utc>,
-        log_id: i32,
+        /// `null` for an adopted session — see `adopted`.
+        log_id: Option<i32>,
+        /// Launched by a previous launcher session: this core does not own the
+        /// process, so there is no live log to open and no exit code to
+        /// report. Stop still works, through the pid.
+        adopted: bool,
     },
     Deleting,
 }
@@ -1749,6 +2059,7 @@ impl From<domain::InstanceDetails> for InstanceDetails {
             modloaders: value.modloaders.into_iter().map(Into::into).collect(),
             java_override: value.java_override.map(Into::into),
             required_java_profile: value.required_java_profile,
+            java_override_mismatch: value.java_override_mismatch,
             notes: value.notes,
             state: value.state.into(),
             icon_revision: value.icon_revision,
@@ -2015,9 +2326,14 @@ impl From<domain::LaunchState> for LaunchState {
             },
             domain::Queued(task) => Self::Queued(task.into()),
             domain::Preparing(task) => Self::Preparing(task.into()),
-            domain::Running { start_time, log_id } => Self::Running {
+            domain::Running {
                 start_time,
-                log_id: log_id.0,
+                log_id,
+                adopted,
+            } => Self::Running {
+                start_time,
+                log_id: log_id.map(|id| id.0),
+                adopted,
             },
             domain::Deleting => Self::Deleting,
         }

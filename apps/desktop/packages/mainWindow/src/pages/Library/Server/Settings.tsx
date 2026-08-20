@@ -1,7 +1,7 @@
 import { rspc } from "@/utils/rspcClient"
 import { Button, Input, Slider, Switch } from "@gd/ui"
 import { Trans, useTransContext } from "@gd/i18n"
-import { createEffect, createSignal, Show } from "solid-js"
+import { createEffect, createSignal, on, Show } from "solid-js"
 import { FEServerDetails } from "@gd/core_module/bindings"
 import { generateSequence } from "@/utils/helpers"
 import Title from "@/pages/Settings/components/Title"
@@ -28,15 +28,24 @@ const Settings = (props: SettingsProps) => {
     mutationKey: ["server.updateServer"]
   }))
 
-  createEffect(() => {
-    const d = props.serverDetails
-    if (!d) return
-    setName(d.name)
-    setXmx(d.xmx)
-    setXms(d.xms)
-    setExtraJavaArgs(d.extraJavaArgs)
-    setAutoRestart(d.autoRestart)
-  })
+  // Reset the local form signals only when the viewed server changes, not on
+  // every `serverDetails` refetch (e.g. the instant-save invalidation from
+  // `save()` below) — otherwise a refetch mid-edit clobbers whatever the
+  // user is still typing in a sibling field.
+  createEffect(
+    on(
+      () => props.serverDetails?.id,
+      () => {
+        const d = props.serverDetails
+        if (!d) return
+        setName(d.name)
+        setXmx(d.xmx)
+        setXms(d.xms)
+        setExtraJavaArgs(d.extraJavaArgs)
+        setAutoRestart(d.autoRestart)
+      }
+    )
+  )
 
   const save = (
     update: Partial<{
@@ -52,7 +61,19 @@ const Settings = (props: SettingsProps) => {
       name: update.name ?? null,
       xmx: update.xmx ?? null,
       xms: update.xms ?? null,
-      extraJavaArgs: update.extraJavaArgs ?? null,
+      // extraJavaArgs is a double-Option on the backend: omitting it leaves
+      // the stored value untouched and `null` clears it, unlike the
+      // single-Option fields above where `null` already means untouched. So
+      // saving e.g. xmx alone simply leaves the field out and cannot blank
+      // the java args.
+      //
+      // Omitted rather than re-sent from props, which is only as fresh as the
+      // last completed refetch: a save fired before this mutation's
+      // invalidation round-trips would carry the pre-edit value and overwrite
+      // the edit that was just saved.
+      ...(update.extraJavaArgs !== undefined
+        ? { extraJavaArgs: update.extraJavaArgs }
+        : {}),
       autoRestart: update.autoRestart ?? null
     })
   }
@@ -71,7 +92,7 @@ const Settings = (props: SettingsProps) => {
       <RowsContainer>
         <Row>
           <Title>
-            <Trans key="instances:_trn_instance_settings.reinstall" />
+            <Trans key="instances:_trn_instance_settings.repair" />
           </Title>
           <RightHandSide>
             <Button
@@ -86,7 +107,7 @@ const Settings = (props: SettingsProps) => {
               onClick={() => {
                 modalsContext?.openModal(
                   {
-                    name: "confirmReinstall"
+                    name: "repairModpack"
                   },
                   {
                     id: props.serverDetails.id,
@@ -97,7 +118,7 @@ const Settings = (props: SettingsProps) => {
               }}
             >
               <i class="i-hugeicons:refresh h-5 w-5" />
-              <Trans key="instances:_trn_instance_settings.reinstall" />
+              <Trans key="instances:_trn_instance_settings.repair" />
             </Button>
           </RightHandSide>
         </Row>

@@ -12,6 +12,7 @@ import {
   createEnabledColumn,
   createDeleteColumn
 } from "./index"
+import { supportsEnableToggle } from "../../addonCapabilities"
 
 /**
  * Unified column config for both Instance and Server addon tables.
@@ -264,6 +265,7 @@ export const createAddonColumns = (config: AddonColumnConfig) => {
                   fallback={<Spinner class="h-5 w-5 text-blue-400" />}
                 >
                   <div
+                    data-testid="mod-row-update"
                     class="i-hugeicons:download-02 cursor-pointer text-lg transition-colors"
                     classList={{
                       "text-green-500 hover:text-green-400": !isDisabled(),
@@ -299,6 +301,12 @@ export const createAddonColumns = (config: AddonColumnConfig) => {
     createEnabledColumn({
       onToggle: config.onToggleMod,
       isDisabled: config.isLocked,
+      // Through `config.getAddonType`, never `row.addon_type` directly: the
+      // two tables this file serves carry the field under different names
+      // (the instance's rspc `Mod` uses `addon_type`, the server's
+      // `ServerAddon` uses `addonType`), which is what that accessor exists
+      // to absorb.
+      isHidden: (row) => !supportsEnableToggle(config.getAddonType(row)),
       disabledTooltip: lockedTooltip
     }),
 

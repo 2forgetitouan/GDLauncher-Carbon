@@ -330,11 +330,28 @@ impl ModplatformCacher for ModrinthModCacher {
         let futures = batch.into_iter().filter_map(|(metadata_id, sha512)| {
             let sha512_match = matches.remove(&sha512);
             sha512_match.map(|(project, team, version)| async move {
-                let file = version
+                // The version matched on the queried hash, but Modrinth's response
+                // is external data: an odd or hash-mismatched result can still list
+                // no file whose own hash matches. Skip just this mod rather than
+                // panicking the shared query/save/icon task group, which would
+                // silently stop all Modrinth caching for the rest of the session.
+                //
+                // `sha512` is `hex::encode`'s (always lowercase) output; `file.hashes.sha512`
+                // is folded lowercase the same way at deserialize
+                // (`carbon_platforms::modrinth::version::Hashes`) — both sides are
+                // guaranteed lowercase, so a plain comparison suffices.
+                let Some(file) = version
                     .files
                     .iter()
                     .find(|file| file.hashes.sha512 == sha512)
-                    .expect("file to be present in it's response");
+                else {
+                    let project_id = &project.id;
+                    let version_id = &version.id;
+                    warn!(
+                        "Modrinth version {version_id} of project {project_id} has no file matching queried hash {sha512}; skipping this mod"
+                    );
+                    return;
+                };
 
                 let authors = team
                     .iter()
@@ -549,7 +566,11 @@ async fn cache_modrinth_meta_unchecked(
 mod test {
     use super::*;
     use carbon_platforms::modrinth::UtcDateTime;
-    use carbon_platforms::modrinth::version::VersionType;
+    use carbon_platforms::modrinth::project::{
+        License, ProjectStatus, ProjectSupportRange, ProjectType,
+    };
+    use carbon_platforms::modrinth::user::{TeamMember, User};
+    use carbon_platforms::modrinth::version::{Hashes, VersionFile};
 
     fn version(id: &str, project: &str, day: u32, version_type: VersionType) -> Version {
         Version {
@@ -604,8 +625,8 @@ mod test {
         );
     }
 
-    /// Every project's versions used to be walked as one list, which collected
-    /// nothing as soon as another project's version came first.
+    /// Walking every project's versions as one list would collect nothing as
+    /// soon as another project's version came first.
     #[test]
     fn versions_of_other_projects_are_ignored_without_hiding_later_ones() {
         let installed = version("installed", "project", 10, VersionType::Release);
@@ -641,5 +662,226 @@ mod test {
         newer.loaders = vec!["not-a-loader".to_string()];
 
         assert_eq!(build_update_paths(&installed, "project", &[newer]), "");
+    }
+
+    /// Regression test: a version can match on the queried hash while an odd or
+    /// hash-mismatched Modrinth response still lists no file whose own hash
+    /// matches it. `save_batch` must skip just that entry rather than panic --
+    /// a panic here would take down the whole shared query/save/icon task group
+    /// (`cache_modplatform`'s unsupervised `join!`), silently stopping ALL
+    /// Modrinth caching for the rest of the session. The rest of the batch --
+    /// including a perfectly normal entry right alongside the bad one -- must
+    /// still cache.
+    #[tokio::test]
+    async fn odd_response_for_one_mod_does_not_abort_the_rest_of_the_batch() {
+        let app = crate::setup_managers_for_test().await;
+
+        // The version matched on this hash, but (an odd/hash-mismatched
+        // response) none of its files actually carry that hash.
+        let bad_sha512 = "b".repeat(128);
+        let mut bad_version = version("bad-version", "bad-project", 1, VersionType::Release);
+        bad_version.files = vec![file("some-other-hash")];
+
+        // A normal response where the file really does carry the queried hash.
+        let good_sha512 = "g".repeat(128);
+        let mut good_version = version("good-version", "good-project", 2, VersionType::Release);
+        good_version.files = vec![file(&good_sha512)];
+
+        let mut versions = HashMap::new();
+        versions.insert(bad_sha512.clone(), bad_version);
+        versions.insert(good_sha512.clone(), good_version);
+
+        insert_test_metadata(&app, "bad-metadata", 1, b"bad-sha512-raw", b"bad-sha1-raw").await;
+        insert_test_metadata(
+            &app,
+            "good-metadata",
+            2,
+            b"good-sha512-raw",
+            b"good-sha1-raw",
+        )
+        .await;
+
+        let bundle = (
+            vec![bad_sha512.clone(), good_sha512.clone()],
+            vec![
+                ("bad-metadata".to_string(), bad_sha512.clone()),
+                ("good-metadata".to_string(), good_sha512.clone()),
+            ],
+            VersionHashesResponse(versions),
+            ProjectsResponse(vec![project("bad-project"), project("good-project")]),
+            vec![team("bad-project"), team("good-project")],
+            Vec::new(),
+        );
+
+        // Must not panic: a panic here would take down the shared
+        // query/save/icon task group and stop Modrinth caching for the rest
+        // of the session.
+        ModrinthModCacher::save_batch(&app, CacheEntityId::Server(1), bundle).await;
+
+        let good_cached = metarepo::get_mr_cache_by_metadata(&app.db, "good-metadata")
+            .await
+            .unwrap();
+        assert!(
+            good_cached.is_some(),
+            "the good entry alongside the bad one should still be cached"
+        );
+
+        let bad_cached = metarepo::get_mr_cache_by_metadata(&app.db, "bad-metadata")
+            .await
+            .unwrap();
+        assert!(
+            bad_cached.is_none(),
+            "the bad entry has no matching file and must be skipped, not cached"
+        );
+    }
+
+    /// Modrinth's stored file hash is external data, while the queried hash is
+    /// this app's own lowercase `hex::encode` output. A response serving the hash
+    /// in a different case still describes the same file, so it must cache
+    /// rather than be skipped as unmatched -- being skipped would also park the
+    /// hash in `ignored_remote_mr_hashes` and stop it being retried for the
+    /// session. The file below is built through real JSON deserialization
+    /// (rather than the `file()` literal-construction helper) so the fixture
+    /// actually exercises `Hashes`' `deserialize_lowercase_hex` fold, the
+    /// mechanism now responsible for this -- not an in-memory struct the fold
+    /// never runs on.
+    #[tokio::test]
+    async fn a_differently_cased_response_hash_still_matches_the_queried_hash() {
+        let app = crate::setup_managers_for_test().await;
+
+        let queried_sha512 = "a".repeat(128);
+        let mut version = version("version", "project", 1, VersionType::Release);
+        let uppercase_sha512 = queried_sha512.to_uppercase();
+        version.files = vec![
+            serde_json::from_str(&format!(
+                r#"{{
+                    "hashes": {{ "sha512": "{uppercase_sha512}", "sha1": "irrelevant" }},
+                    "url": "https://example.invalid/{uppercase_sha512}.jar",
+                    "filename": "{uppercase_sha512}.jar",
+                    "primary": true,
+                    "size": 1,
+                    "file_type": null
+                }}"#
+            ))
+            .unwrap(),
+        ];
+
+        let mut versions = HashMap::new();
+        versions.insert(queried_sha512.clone(), version);
+
+        insert_test_metadata(&app, "metadata", 1, b"sha512-raw", b"sha1-raw").await;
+
+        let bundle = (
+            vec![queried_sha512.clone()],
+            vec![("metadata".to_string(), queried_sha512.clone())],
+            VersionHashesResponse(versions),
+            ProjectsResponse(vec![project("project")]),
+            vec![team("project")],
+            Vec::new(),
+        );
+
+        ModrinthModCacher::save_batch(&app, CacheEntityId::Server(1), bundle).await;
+
+        let cached = metarepo::get_mr_cache_by_metadata(&app.db, "metadata")
+            .await
+            .unwrap();
+        assert!(
+            cached.is_some(),
+            "an uppercase response hash describes the same file and must still cache"
+        );
+    }
+
+    async fn insert_test_metadata(
+        app: &App,
+        metadata_id: &str,
+        murmur: i32,
+        sha512: &[u8],
+        sha1: &[u8],
+    ) {
+        metarepo::insert_metadata(
+            &app.db,
+            metadata_id,
+            murmur,
+            sha512,
+            sha1,
+            "forge",
+            None,
+            None,
+            None,
+            None,
+            None,
+            DbDateTime(chrono::Utc::now().fixed_offset()),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn project(id: &str) -> Project {
+        Project {
+            slug: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            categories: Vec::new(),
+            client_side: ProjectSupportRange::Required,
+            server_side: ProjectSupportRange::Required,
+            body: String::new(),
+            additional_categories: Vec::new(),
+            issues_url: None,
+            source_url: None,
+            wiki_url: None,
+            discord_url: None,
+            donation_urls: Vec::new(),
+            project_type: ProjectType::Mod,
+            downloads: 0,
+            icon_url: None,
+            color: None,
+            id: id.to_string(),
+            team: format!("{id}-team"),
+            moderator_message: None,
+            published: "2026-01-01T00:00:00Z".parse::<UtcDateTime>().unwrap(),
+            updated: "2026-01-01T00:00:00Z".parse::<UtcDateTime>().unwrap(),
+            approved: None,
+            followers: 0,
+            status: ProjectStatus::Approved,
+            license: License {
+                id: "MIT".to_string(),
+                name: "MIT".to_string(),
+                url: None,
+            },
+            versions: Vec::new(),
+            game_versions: vec!["1.20.1".to_string()],
+            loaders: vec!["forge".to_string()],
+            gallery: Vec::new(),
+        }
+    }
+
+    fn team(project_id: &str) -> TeamResponse {
+        TeamResponse(vec![TeamMember {
+            team_id: format!("{project_id}-team"),
+            user: User {
+                username: "author".to_string(),
+                name: None,
+                id: "author-id".to_string(),
+                avatar_url: None,
+            },
+            role: "Owner".to_string(),
+            accepted: true,
+            ordering: None,
+        }])
+    }
+
+    fn file(sha512: &str) -> VersionFile {
+        VersionFile {
+            hashes: Hashes {
+                sha512: sha512.to_string(),
+                sha1: "irrelevant".to_string(),
+                others: HashMap::new(),
+            },
+            url: format!("https://example.invalid/{sha512}.jar"),
+            filename: format!("{sha512}.jar"),
+            primary: true,
+            size: 1,
+            file_type: None,
+        }
     }
 }

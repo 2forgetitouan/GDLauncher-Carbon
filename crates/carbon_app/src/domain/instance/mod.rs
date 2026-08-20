@@ -52,6 +52,11 @@ pub struct InstanceDetails {
     pub modloaders: Vec<info::ModLoader>,
     pub java_override: Option<info::JavaOverride>,
     pub required_java_profile: Option<String>,
+    /// True when a user-set Java override resolves to a major version that does
+    /// not satisfy `required_java_profile`, so the UI can warn before launch.
+    /// Only reported when the override's Java can be identified from already
+    /// scanned Javas (no probing at details-fetch time).
+    pub java_override_mismatch: bool,
     pub state: LaunchState,
     pub notes: String,
     pub icon_revision: Option<u32>,
@@ -95,7 +100,13 @@ pub enum LaunchState {
     Preparing(VisualTaskId),
     Running {
         start_time: DateTime<Utc>,
-        log_id: GameLogId,
+        /// `None` for an adopted session — see `adopted`.
+        log_id: Option<GameLogId>,
+        /// Launched by a previous launcher session and picked back up at
+        /// startup. This core owns neither the process's stdout nor its exit
+        /// status, so there is no log and no exit code; the one action such an
+        /// instance offers is Stop.
+        adopted: bool,
     },
     Deleting,
 }

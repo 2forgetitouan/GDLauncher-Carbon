@@ -11,7 +11,10 @@ use crate::managers::AppInner;
 use crate::managers::instance::log::{
     GameLog, LogEntry, LogEntrySourceKind, format_message_as_log4j_event,
 };
-use crate::managers::instance::modpack::{PackVersionFile, packinfo};
+use crate::managers::instance::modpack::{
+    PackVersionFile, RepairMarkerFile, apply_plan, disk_scan, normalize_cleanup_path, packinfo,
+    walk_untracked_files,
+};
 use crate::managers::instance::schema::make_instance_config;
 use crate::managers::java::java_checker::{JavaChecker, RealJavaChecker};
 use crate::managers::java::managed::Step;
@@ -39,8 +42,7 @@ use carbon_platforms::modrinth::search::VersionID;
 use carbon_rt_path::InstancePath;
 use chrono::{DateTime, Local, Utc};
 use futures::Future;
-use md5::{Digest, Md5};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -53,7 +55,7 @@ use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio::{io::AsyncReadExt, sync::mpsc};
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 pub type TSubtasks = Arc<TSubtasksInner>;
 
@@ -75,6 +77,76 @@ pub struct TSubtasksInner {
     pub t_finalize_import: Option<Subtask>,
 }
 
+/// Whether `tmp-packinfo.json` (the full post-apply record) must be
+/// (re)derived by walking `.setup/staging`, or is already the authoritative
+/// target record left by an earlier, possibly-interrupted pass over this
+/// exact change-pack-version session and must be preserved untouched.
+///
+/// `apply_started` (`.setup/apply-started`, written by
+/// [`process_modpack_staging`] right before it calls [`execute_plan`], the
+/// only thing that ever destructively consumes `.setup/staging`) is the
+/// discriminator — deliberately *not* `skip_overrides`, which flips true as
+/// soon as override extraction finishes, well before the mod-download phase
+/// and the `tmp-packinfo.json` write even run. A crash in that gap leaves
+/// `skip_overrides` true while `.setup/staging` is still completely
+/// untouched; keying regeneration on it alone would suppress regeneration
+/// for a record that was never even written, silently discarding the
+/// staged download and completing the launch with nothing applied. Whether
+/// `execute_plan` has actually *started* is the only thing that tells us
+/// re-walking staging might no longer be safe:
+///
+/// - `apply_started` false: staging is guaranteed unconsumed (execute_plan
+///   cannot run without a `tmp-packinfo.json` to plan against, and nothing
+///   else touches staging), so re-deriving `tmp-packinfo.json` from it is
+///   always safe — this covers a first pass, a crash before extraction
+///   finished, and a crash anywhere between extraction finishing and
+///   `execute_plan` actually starting (including a crash mid-write of
+///   `tmp-packinfo.json` itself).
+/// - `apply_started` true: `.setup/staging` may be partially or fully
+///   consumed by whatever `execute_plan` already applied before a crash.
+///   Re-deriving `tmp-packinfo.json` from it now would silently drop every
+///   already-applied path from the very record meant to describe the target
+///   state (the resumed run then treats those paths as dropped by the pack
+///   and can delete them). Leaving `tmp-packinfo.json` untouched is correct
+///   whether it currently exists (the apply is still in flight; this
+///   preserves the complete pre-apply record for
+///   [`process_modpack_staging`] to resume against) or not (the apply
+///   already finished and promoted it to `packinfo.json`;
+///   `process_modpack_staging` recognises that on its own, via the same
+///   `apply_started` marker, and skips straight to finishing cleanup — see
+///   its doc comment for the other half of this invariant).
+fn tmp_packinfo_must_be_regenerated(file_provided: bool, apply_started: bool) -> bool {
+    file_provided && !apply_started
+}
+
+/// Whether [`process_modpack_staging`] finding `tmp-packinfo.json` missing
+/// proves the apply already fully completed and got promoted to
+/// `packinfo.json`, rather than simply never having started.
+///
+/// `packinfo_exists` alone is not enough: a *version change* on an
+/// already-installed modpack has an old `packinfo.json` on disk from before
+/// the change even began, so its mere presence proves nothing about whether
+/// *this* apply ran. `apply_started` (`.setup/apply-started`) is what
+/// proves it — written only right before [`execute_plan`] is first called
+/// for the record currently being applied, so its presence is proof
+/// `execute_plan` actually ran for that record; combined with `tmp` being
+/// gone (checked by the caller before this is consulted), the only way
+/// `execute_plan` can have run *and* `tmp` be gone is a successful promote.
+/// Requiring both `apply_started` and `packinfo_exists` — rather than
+/// either alone — is deliberate: `apply_started` alone can't rule out a
+/// crash between promoting (which needs `packinfo_exists`) and finishing
+/// (this function isn't reached once `packinfo_exists` when `apply_started`
+/// is false, since `tmp_packinfo_must_be_regenerated` would have already
+/// regenerated `tmp` in that case, before this function ever runs). Only
+/// `apply_started && packinfo_exists` is unambiguous proof of a completed,
+/// promoted apply; any other combination (most importantly `apply_started`
+/// false, whether or not an old `packinfo_exists`) must never be read as
+/// "already applied" — that would silently mark a change complete having
+/// applied nothing at all.
+fn staging_apply_already_promoted(apply_started: bool, packinfo_exists: bool) -> bool {
+    apply_started && packinfo_exists
+}
+
 /// This function prepares the modpack in a staging directory in the instance folder.
 /// The original instane data is not modified.
 ///
@@ -90,7 +162,12 @@ pub async fn process_modpack(
     instance_shortpath: String,
     task: &VisualTask,
     has_callback_task: bool,
-) -> anyhow::Result<(TSubtasks, Option<StandardVersion>)> {
+) -> anyhow::Result<(
+    TSubtasks,
+    Option<StandardVersion>,
+    Option<RepairMarkerFile>,
+    Option<disk_scan::DiskScan>,
+)> {
     let mut version: Option<StandardVersion> = None;
 
     let runtime_path = app.settings_manager().runtime_path.clone();
@@ -108,9 +185,47 @@ pub async fn process_modpack(
 
     let packinfo_path = instance_root.join("packinfo.json");
     let tmp_packinfo_path = instance_root.join("tmp-packinfo.json");
-    let packinfo = match tokio::fs::read_to_string(packinfo_path).await {
-        Ok(text) => Some(packinfo::parse_packinfo(&text).context("while parsing packinfo json")?),
-        Err(_) => None,
+
+    // Absent marker (including a `.setup` left behind by an older build that
+    // never wrote one) means an ordinary version change.
+    let repair_marker_path = setup_path.join("repair");
+    let repair_options: Option<RepairMarkerFile> =
+        match tokio::fs::read_to_string(&repair_marker_path).await {
+            Ok(s) => Some(serde_json::from_str(&s).context("while parsing repair marker json")?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+
+    // Named for what it's used for below (skip-optimisation oracle for the
+    // platform prep fns), not merely what it holds. A repair judges "needs
+    // download" against what is actually on disk right now, not against the
+    // record — a corrupt or missing file must be re-fetched even when the
+    // record says it was fine.
+    //
+    // Repair mode's full-tree walk (`scan_instance_as_packinfo`) also yields
+    // a `DiskScan` with Present/Disabled/twin semantics identical to
+    // `process_modpack_staging`'s own `scan_disk_state` over the same
+    // directory (see that function's own doc) — carried alongside as
+    // `oracle_disk_scan` so `process_modpack_staging` can reuse this single
+    // walk instead of hashing every tracked file a second time. `None`
+    // outside repair mode: an ordinary version change never runs the oracle
+    // walk at all, so `process_modpack_staging` always scans for itself in
+    // that case.
+    let (skip_oracle, oracle_disk_scan) = match &repair_options {
+        Some(_) => {
+            let (packinfo, disk_scan) =
+                disk_scan::scan_instance_as_packinfo(&instance_path.get_data_path()).await?;
+            (Some(packinfo), Some(disk_scan))
+        }
+        None => (
+            match tokio::fs::read_to_string(&packinfo_path).await {
+                Ok(text) => {
+                    Some(packinfo::parse_packinfo(&text).context("while parsing packinfo json")?)
+                }
+                Err(_) => None,
+            },
+            None,
+        ),
     };
 
     let t_modpack = match is_setup && !is_modpack_complete {
@@ -201,6 +316,23 @@ pub async fn process_modpack(
         // TODO: look into this
         let skip_overrides_path = setup_path.join("modpack-skip-overrides");
         let skip_overrides = skip_overrides_path.is_dir();
+
+        // Whether `process_modpack_staging` has ever started consuming
+        // `.setup/staging` for the record currently on disk — written right
+        // before it calls `execute_plan` (see there) and never removed
+        // except by `.setup` itself being wiped (full completion, or a fresh
+        // `change_modpack`/`repair_modpack`). This is deliberately a
+        // *different* signal from `skip_overrides`: `skip_overrides` flips
+        // true as soon as extraction finishes, well before the mod-download
+        // phase and the `tmp-packinfo.json` write below even run, so a crash
+        // in that gap would leave `skip_overrides` true while staging is
+        // still completely untouched — keying the regeneration decision on
+        // it alone would suppress regeneration for a record that was never
+        // even written, losing the staged download outright. Whether
+        // `execute_plan` has actually started is the only thing that tells
+        // us staging might no longer be safe to re-walk.
+        let apply_started_path = setup_path.join("apply-started");
+        let apply_started = apply_started_path.exists();
 
         let modpack = match tokio::fs::read_to_string(&change_version_path).await {
             Ok(text) => Some(Modpack::from(serde_json::from_str::<PackVersionFile>(
@@ -373,7 +505,7 @@ pub async fn process_modpack(
                     &cffile_path,
                     &instance_prep_path,
                     skip_overrides,
-                    packinfo.as_ref(),
+                    skip_oracle.as_ref(),
                     t_addon_metadata,
                     modpack_progress_tx,
                 )
@@ -441,7 +573,7 @@ pub async fn process_modpack(
                     &mrfile_path,
                     &instance_prep_path,
                     skip_overrides,
-                    packinfo.as_ref(),
+                    skip_oracle.as_ref(),
                     modpack_progress_tx,
                 )
                 .await?;
@@ -465,6 +597,23 @@ pub async fn process_modpack(
                 Some(gdl_version)
             }
             Some(Modplatform::GDLPack) => {
+                // gdlpack's own skip predicate (`gdlpack.rs`'s
+                // `existing_packinfo`/`skip_path` lookup) only checks
+                // whether a path is PRESENT in the oracle, never whether its
+                // hash matches — unlike the curseforge/modrinth prep fns.
+                // Under an ordinary version change that is merely a missed
+                // optimisation (the record is trusted anyway); under repair
+                // the oracle is a live disk scan, so a merely-*existing*
+                // damaged file would be skip-optimised as-is and its
+                // corrupt hash promoted into packinfo as canonical —
+                // laundering the corruption instead of fixing it. No
+                // `Modpack` variant can select GDLPack today (making this
+                // unreachable in practice), but refuse outright rather than
+                // leave a live trap for whenever one can.
+                if repair_options.is_some() {
+                    bail!("repair is not supported for GDLPack-installed instances");
+                }
+
                 let (modpack_progress_tx, mut modpack_progress_rx) =
                     tokio::sync::watch::channel(gdlpack::ProgressState::Idle);
 
@@ -495,7 +644,7 @@ pub async fn process_modpack(
                     &gdlpack_path,
                     &instance_prep_path,
                     skip_overrides,
-                    packinfo.as_ref(),
+                    skip_oracle.as_ref(),
                     modpack_progress_tx,
                 )
                 .await?;
@@ -610,10 +759,14 @@ pub async fn process_modpack(
         // Only generate staging-packinfo if we actually processed a modpack
         // (i.e., file was Some). Otherwise this is just a version/modloader change
         // and we should not touch the existing mods.
-        if file.is_some() {
+        if tmp_packinfo_must_be_regenerated(file.is_some(), apply_started) {
             // normally there would be a problem here because we would be skipping any mods removed by users
             // but since we dont try to update those anyway its fine.
-            let mut files = skipped_mods;
+            //
+            // Cloned rather than moved: `skipped_mods` is walked again below
+            // to merge its hashes into the freshly scanned packinfo, since
+            // `scan_dir` never staged these paths and so cannot see them.
+            let mut files = skipped_mods.clone();
             // snapshot filetree before applying
             let mut walker = NormalizedWalkdir::new(&staging_dir.join("instance"))?;
             while let Some(entry) = walker.next()? {
@@ -631,8 +784,24 @@ pub async fn process_modpack(
             let files_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
             // At this point the modpack files are all in the staging directory, so that's the path we need to scan.
             // The packinfo on the other hand is in the instance folder itself.
-            let packinfo =
+            let mut packinfo =
                 packinfo::scan_dir(&instance_prep_path.get_data_path(), Some(&files_refs)).await?;
+
+            // Skip-optimised files were never staged, so the scan cannot see
+            // them. "Skipped" means the oracle's hash matched the manifest's,
+            // so the oracle entry IS the target hash — merge it, or every
+            // unchanged file falls out of the record (the stale-survivor bug).
+            for skipped in &skipped_mods {
+                if packinfo.files.contains_key(skipped) {
+                    continue;
+                }
+                let Some(hashes) = skip_oracle.as_ref().and_then(|o| o.files.get(skipped)) else {
+                    bail!(
+                        "skip-optimised path {skipped} has no oracle entry — refusing to write an incomplete packinfo"
+                    );
+                };
+                packinfo.files.insert(skipped.clone(), hashes.clone());
+            }
 
             let packinfo_str = packinfo::make_packinfo(packinfo)?;
             tokio::fs::write(tmp_packinfo_path, packinfo_str).await?;
@@ -677,16 +846,40 @@ pub async fn process_modpack(
         t_finalize_import,
     };
 
-    Ok((Arc::new(subtasks), version))
+    Ok((
+        Arc::new(subtasks),
+        version,
+        repair_options,
+        oracle_disk_scan,
+    ))
 }
 
-// TODO: Modpack staging is not atomic and does not track applied changes, so if the process is interrupted,
-// the instance will be in an inconsistent state.
+/// Applies the staged files for a modpack version change or repair,
+/// reconciling them against the instance's live data.
+///
+/// Not atomic at the filesystem level — planning, [`execute_plan`], the
+/// audit write, promoting `tmp-packinfo.json` to `packinfo.json`, and
+/// removing `staging_dir` are all separate operations, any of which can be
+/// cut off by a crash — but every step here, together with the
+/// `apply_started`-gated guard in [`process_modpack`]
+/// (`tmp_packinfo_must_be_regenerated`) that stops a resumed pass from
+/// re-deriving `tmp-packinfo.json` by re-walking a partially-consumed
+/// `staging_dir`, is ordered to maintain one invariant: **at every
+/// interruption point, either the pre-existing `packinfo.json`, the
+/// untouched `tmp-packinfo.json` written before this function's
+/// [`execute_plan`] call ever runs, or the newly-promoted `packinfo.json`
+/// fully describes the target state.** A resumed run only ever has to pick
+/// which of those it landed on (the `tmp_packinfo_path.exists()` branch
+/// below, itself only trusted once `.setup/apply-started` confirms
+/// `execute_plan` really did run before) — never reconstruct one from a
+/// filesystem walk that may itself be mid-consumption.
 pub async fn process_modpack_staging(
     app: Arc<AppInner>,
     instance_id: InstanceId,
     instance_shortpath: String,
     t_subtasks: &TSubtasks,
+    repair_options: Option<RepairMarkerFile>,
+    oracle_disk_scan: Option<disk_scan::DiskScan>,
 ) -> anyhow::Result<()> {
     let runtime_path = app.settings_manager().runtime_path.clone();
     let instance_path = runtime_path
@@ -716,119 +909,172 @@ pub async fn process_modpack_staging(
 
         t_subtasks.t_apply_staging.start_opaque();
 
-        let change_version_path = setup_path.join("change-pack-version.json");
-        let overwrite_changed = !change_version_path.exists(); // TODO
+        let packinfo_path = instance_root.join("packinfo.json");
+        let tmp_packinfo_path = instance_root.join("tmp-packinfo.json");
+        let apply_started_path = setup_path.join("apply-started");
 
-        let staged_text = tokio::fs::read_to_string(&staging_packinfo).await?;
-        let staging_snapshot = serde_json::from_str::<Vec<&str>>(&staged_text)
-            .context("could not parse staging snapshot")?;
+        // `tmp_packinfo_path` missing is ambiguous on its own: it means
+        // either "never written yet this session" (staging is unconsumed —
+        // see `tmp_packinfo_must_be_regenerated`'s doc, that state is handled
+        // by `process_modpack` regenerating it before this function is even
+        // reached, so this branch is never entered for it) or "already
+        // promoted" (renamed to `packinfo_path`, below). `staging_apply_already_promoted`
+        // is what disambiguates them — see its own doc.
+        if !tmp_packinfo_path.exists() {
+            if !staging_apply_already_promoted(apply_started_path.exists(), packinfo_path.exists())
+            {
+                bail!(
+                    "instance {instance_id} has a staged modpack apply (staging-packinfo.json \
+                     present) with no tmp-packinfo.json, but the apply-started/packinfo.json \
+                     state doesn't prove a completed, promoted apply — cannot determine the \
+                     target record"
+                );
+            }
 
-        #[derive(Debug)]
-        enum SkipReplaceReason {
-            DeletedByUser,
-            ModifiedByUser([u8; 16], [u8; 16]),
-            InSaveFolder,
+            finish_promoted_staging(&staging_dir, &setup_path).await?;
+            t_subtasks.t_apply_staging.complete_opaque();
+
+            // Trigger caching now that modpack installation is complete
+            app.meta_cache_manager()
+                .watch_and_prioritize(Some(
+                    crate::managers::metadata::cache::CacheEntityId::Instance(instance_id),
+                ))
+                .await;
+
+            return Ok(());
         }
 
-        let mut new_files = Vec::<String>::new();
-        let mut deleted_files = Vec::<String>::new();
-        let mut replaced_files = Vec::<String>::new();
-        let mut skipped_replacements = Vec::<(String, SkipReplaceReason)>::new();
+        let old_packinfo = match tokio::fs::read_to_string(&packinfo_path).await {
+            Ok(s) => Some(packinfo::parse_packinfo(&s)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let target_packinfo =
+            packinfo::parse_packinfo(&tokio::fs::read_to_string(&tmp_packinfo_path).await?)?;
 
-        let packinfo_path = instance_root.join("packinfo.json");
-        let packinfo = match tokio::fs::read_to_string(packinfo_path).await {
-            Ok(text) => {
-                Some(packinfo::parse_packinfo(&text).context("while parsing packinfo json")?)
+        // Staged set: files physically present under .setup/staging/instance,
+        // as packinfo-style keys.
+        let mut staged = HashSet::new();
+        let mut walker = NormalizedWalkdir::new(&staging_dir.join("instance"))?;
+        while let Some(entry) = walker.next()? {
+            if entry.is_dir {
+                continue;
             }
-            Err(_) => None,
+            // Mirrors packinfo::scan_dir's own `.disabled` stripping
+            // (packinfo/scan.rs:30-32): a pack that ships an override
+            // disabled by default stages it under the `.disabled` name, but
+            // tmp-packinfo.json (built by scan_dir) keys it under the
+            // enabled name. `staged` has to match that key shape, or a path
+            // whose only staged copy is `.disabled`-suffixed looks unstaged
+            // to the planner and a fresh install of that path errors
+            // permanently (MissingStagedSource).
+            let mut key = entry.relative_path.to_string();
+            if key.ends_with(".disabled") {
+                key.truncate(key.len() - ".disabled".len());
+            }
+            staged.insert(key);
+        }
+
+        let universe: BTreeSet<String> = old_packinfo
+            .iter()
+            .flat_map(|p| p.files.keys().cloned())
+            .chain(target_packinfo.files.keys().cloned())
+            .collect();
+        // `oracle_disk_scan`, when given, is repair's own skip-optimisation
+        // oracle walk (`scan_instance_as_packinfo`, called by `process_modpack`
+        // before this function ever runs) reused instead of hashing every
+        // tracked file a second time: nothing under `instance/` changes
+        // between that walk and this point — every write in between lands
+        // under `.setup/staging`, a separate tree, and `execute_plan` below
+        // is what first touches `instance/` at all — so the snapshot is
+        // still exactly accurate here. Falls back to a fresh scan whenever
+        // it's absent (an ordinary version change, which never runs the
+        // oracle walk at all).
+        let disk_scan::DiskScan {
+            states: disk,
+            coexisting_disabled_twin_md5,
+        } = match oracle_disk_scan {
+            Some(scan) => scan,
+            None => disk_scan::scan_disk_state(&instance_root.join("instance"), &universe).await?,
         };
 
-        debug!("Applying staged instance files");
-        let r: anyhow::Result<_> = async {
-            if let Some(packinfo) = packinfo {
-                for (oldfile, oldfilehash) in &packinfo.files {
-                    let mut original_file = instance_root.join("instance").join(&oldfile[1..]);
+        // Whether this instance's data dir lives on a filesystem that folds
+        // path case together (Windows, default-configuration macOS) — see
+        // `disk_scan::probe_case_insensitive`'s own doc for the fallback
+        // semantics. Threaded into both the planner and the untracked-file
+        // walk below so a case-only rename can't lose the file it renames
+        // and a case-variant spelling of a tracked path is never treated as
+        // untracked/deletable.
+        let fs_case_insensitive =
+            disk_scan::probe_case_insensitive(&instance_root.join("instance")).await;
 
-                    trace!("Checking for replacement for packinfo file: {original_file:?}");
+        // Absent marker -> ordinary version-change reconciliation, unchanged
+        // from before repair mode existed. Present -> re-reconcile every
+        // pack-tracked path against `target` alone (see
+        // `apply_plan::decide_repair`), regardless of what `old` says.
+        let mode = match &repair_options {
+            Some(options) => apply_plan::ApplyMode::Repair {
+                re_enable_disabled: options.re_enable_disabled,
+            },
+            None => apply_plan::ApplyMode::VersionChange,
+        };
 
-                    if !original_file.exists() {
-                        let mut name = original_file.file_name().unwrap().to_owned();
-                        name.push(".disabled");
-                        original_file.set_file_name(name);
+        let entries = apply_plan::plan(apply_plan::PlanInputs {
+            old: old_packinfo.as_ref(),
+            target: &target_packinfo,
+            staged: &staged,
+            disk: &disk,
+            coexisting_disabled_twin_md5: &coexisting_disabled_twin_md5,
+            mode,
+            fs_case_insensitive,
+        })?;
 
-                        if !original_file.exists() {
-                            // either the user deleted it or we already deleted it in the next check, skip
-                            skipped_replacements
-                                .push((oldfile.clone(), SkipReplaceReason::DeletedByUser));
-                            continue;
-                        }
-                    }
-
-                    let mut original_md5 = Md5::new();
-                    let mut file = tokio::fs::File::open(&original_file).await?;
-                    carbon_scheduler::buffered_digest(&mut file, |chunk| {
-                        original_md5.update(chunk);
-                    })
-                    .await?;
-                    drop(file);
-                    let original_md5: [u8; 16] = original_md5.finalize().into();
-
-                    if original_md5 != oldfilehash.md5 {
-                        // the user has modified this file so we shouldn't touch it
-                        skipped_replacements.push((
-                            oldfile.clone(),
-                            SkipReplaceReason::ModifiedByUser(oldfilehash.md5, original_md5),
-                        ));
-                        continue;
-                    }
-
-                    if !staging_snapshot.contains(&(&oldfile as &str)) {
-                        if oldfile.starts_with("/saves") {
-                            skipped_replacements
-                                .push((oldfile.clone(), SkipReplaceReason::InSaveFolder));
-                            continue;
-                        }
-
-                        // file is not present in new version and old version was not changed, delete
-                        tokio::fs::remove_file(original_file).await?;
-                        deleted_files.push(oldfile.clone());
-                        continue;
-                    }
-
-                    let staged_file = staging_dir.join("instance").join(&oldfile[1..]);
-
-                    if staged_file.is_file() {
-                        // old file matches the snapshotted version and new file is present, replace
-                        tokio::fs::rename(staged_file, original_file).await?;
-                        replaced_files.push(oldfile.clone());
-                    }
-                }
-            }
-
-            for entry in walkdir::WalkDir::new(&staging_dir) {
-                let entry = entry?;
-
-                let staged_file = entry.path().to_path_buf();
-                let relpath = staged_file.strip_prefix(&staging_dir).unwrap();
-                let original_file = instance_root.join(relpath);
-
-                if entry.metadata()?.is_file() && !original_file.exists() {
-                    // there was no record of this file in the packinfo or it would've been moved previously,
-                    // and the user has not created one in its place, add the file
-
-                    new_files.push(relpath.to_string_lossy().to_string());
-                    tokio::fs::create_dir_all(original_file.parent().unwrap()).await?;
-                    tokio::fs::rename(staged_file, original_file).await?;
-                }
-            }
-
-            Ok(())
+        // Written before `execute_plan` — the only thing that destructively
+        // consumes `staging_dir` — ever runs: from this point on, staging is
+        // no longer provably unconsumed, so `process_modpack` must not
+        // re-derive `tmp_packinfo_path` from it on any later resume (see
+        // `tmp_packinfo_must_be_regenerated`'s doc). Left in place until
+        // `.setup` itself is wiped (full completion, or a fresh
+        // `change_modpack`/`repair_modpack`) — no explicit removal needed.
+        //
+        // Explicitly fsynced — both the file's own bytes and the directory
+        // entry that makes it visible — before `execute_plan` is allowed to
+        // run. A plain `write` only guarantees the OS's page/dentry cache
+        // sees it, not that it has actually reached disk; on a filesystem
+        // without ordered metadata journaling (FAT32/exFAT — a real
+        // placement for an instance directory on an external or portable
+        // drive) the kernel is free to persist `execute_plan`'s later
+        // renames to `staging_dir` before it gets around to persisting this
+        // marker's creation. A power loss in that window would then resume
+        // with the marker gone but staging already partially consumed —
+        // the exact round-1 corruption this marker exists to rule out. The
+        // ordering (marker durable strictly before any rename below) is
+        // what's load-bearing here, not merely that the write eventually
+        // lands.
+        {
+            let marker_file = File::create(&apply_started_path).await?;
+            marker_file.sync_all().await?;
         }
-        .await;
+        fsync_dir(&setup_path).await?;
 
-        if let Err(e) = r {
-            return Err(e.context("Failed to apply staged instance changes"));
-        }
+        execute_plan(&entries, &instance_root, &staging_dir).await?;
+
+        // Repair-only: paths the user explicitly ticked for removal in the
+        // preview, applied after the plan so a cleanup can never race the
+        // pack's own reconciliation of the same path.
+        let user_removed = match &repair_options {
+            Some(options) => {
+                apply_user_cleanup(
+                    &options.cleanup_paths,
+                    old_packinfo.as_ref(),
+                    &target_packinfo,
+                    &instance_root,
+                    fs_case_insensitive,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
 
         trace!("Creating update audit files");
         let audit_dir = instance_root.join(".install_audit");
@@ -841,70 +1087,27 @@ pub async fn process_modpack_staging(
         tokio::fs::create_dir(&audit_dir).await?;
 
         let audit_file = audit_dir.join("audit.txt");
-        let mut audit_txt = "GDLauncher Modpack Install/Update Audit\n".to_string();
-
-        if (!skipped_replacements.is_empty()) {
-            audit_txt += "\nFiles that could not be replaced:\n";
-
-            for (file, reason) in skipped_replacements {
-                match reason {
-                    SkipReplaceReason::DeletedByUser => {
-                        audit_txt += &format!(" - {file}: deleted by user\n")
-                    }
-                    SkipReplaceReason::ModifiedByUser(original, current) => {
-                        audit_txt += &format!(
-                            " - {file}: modified by user\n     original md5: {}\n     current md5:  {}\n",
-                            hex::encode(original),
-                            hex::encode(current),
-                        )
-                    }
-                    SkipReplaceReason::InSaveFolder => {
-                        audit_txt += &format!(" - {file}: files in /saves will never be modified\n")
-                    }
-                }
-            }
-        }
-
-        if (!deleted_files.is_empty()) {
-            audit_txt += "\nFiles deleted:\n";
-
-            for file in deleted_files {
-                audit_txt += &format!(" - {file}\n");
-            }
-        }
-
-        if (!replaced_files.is_empty()) {
-            audit_txt += "\nFiles replaced:\n";
-
-            for file in replaced_files {
-                audit_txt += &format!(" - {file}\n");
-            }
-        }
-
-        if (!new_files.is_empty()) {
-            audit_txt += "\nFiles created:\n";
-
-            for file in new_files {
-                audit_txt += &format!(" - {file}\n");
-            }
-        }
-
+        let audit_txt = render_audit(&entries, &user_removed);
         tokio::fs::write(audit_file, audit_txt).await?;
 
+        // Promote before removing staging, not after: once this rename
+        // lands, `packinfo_path` fully describes the target state on its
+        // own, so a crash between the two leaves the "tmp-packinfo.json
+        // missing, `.setup/apply-started` present, packinfo.json present"
+        // branch above (`staging_apply_already_promoted`) to finish the
+        // leftover `staging_dir` cleanup on the next resume. The reverse
+        // order would leave a window where a crash between the two calls
+        // loses `staging_dir`'s remaining contents while `tmp_packinfo_path`
+        // is still unpromoted — at that point neither file fully describes
+        // the target state, and a resumed `process_modpack` would rebuild
+        // `tmp-packinfo.json` by walking a `staging_dir` that no longer has
+        // anything left to walk.
+        tokio::fs::rename(&tmp_packinfo_path, &packinfo_path).await?;
+
         trace!("Cleaning up staging directory");
-        tokio::fs::remove_dir_all(staging_dir).await?;
+        finish_promoted_staging(&staging_dir, &setup_path).await?;
         trace!("Staging complete");
         t_subtasks.t_apply_staging.complete_opaque();
-
-        if instance_root.join("tmp-packinfo.json").exists() {
-            tokio::fs::rename(
-                instance_root.join("tmp-packinfo.json"),
-                instance_root.join("packinfo.json"),
-            )
-            .await?;
-        }
-
-        tokio::fs::write(setup_path.join("modpack-complete"), "").await?;
 
         // Trigger caching now that modpack installation is complete
         app.meta_cache_manager()
@@ -916,3 +1119,420 @@ pub async fn process_modpack_staging(
 
     Ok(())
 }
+
+/// Finishes the leftover cleanup of a staging pass whose apply already fully
+/// landed — `packinfo_path` (checked by the caller before this is invoked)
+/// already fully describes the target state, so all that is left is
+/// removing the now-superfluous `staging_dir` and recording
+/// `modpack-complete`. Used both for a pass that just promoted
+/// `tmp-packinfo.json` itself and for a resumed pass that finds the promote
+/// already happened (`tmp-packinfo.json` gone, `.setup/apply-started`
+/// present, `packinfo.json` present — see `staging_apply_already_promoted`,
+/// which the caller uses to tell this apart from an apply that simply never
+/// started) — see [`process_modpack_staging`]'s doc comment for the
+/// invariant this is the tail of. Never touches `packinfo_path` or
+/// `tmp_packinfo_path` itself.
+async fn finish_promoted_staging(staging_dir: &Path, setup_path: &Path) -> anyhow::Result<()> {
+    tokio::fs::remove_dir_all(staging_dir).await?;
+    tokio::fs::write(setup_path.join("modpack-complete"), "").await?;
+    Ok(())
+}
+
+/// Fsyncs `dir`'s own directory entry (not its contents) — the other half
+/// of durably creating a file: a file's own `sync_all` only guarantees its
+/// bytes reached disk, not that the directory entry pointing at it did too.
+/// Without this, a crash can leave a freshly-created file's bytes durable on
+/// disk yet the directory listing that would make it discoverable again
+/// still unflushed, so the file appears to have never been created at all
+/// after an unclean restart — undermining `sync_all`'s own guarantee for
+/// exactly the callers (like the `apply-started` marker write) that depend
+/// on "this file exists" surviving a crash in a specific order relative to
+/// other writes.
+///
+/// No-op on Windows: opening a bare directory as a `File` is rejected there
+/// (`ERROR_ACCESS_DENIED`), and it isn't needed — NTFS's own ordered
+/// metadata journaling already guarantees a completed file create is
+/// durable before any later write that depends on it, unlike a filesystem
+/// without ordered metadata journaling (FAT32/exFAT — a real placement for
+/// an instance directory on an external or portable drive), where this call
+/// is what closes that gap.
+#[cfg(windows)]
+async fn fsync_dir(_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn fsync_dir(dir: &Path) -> anyhow::Result<()> {
+    File::open(dir).await?.sync_all().await?;
+    Ok(())
+}
+
+/// Carries out every [`apply_plan::PlanEntry`] against the real filesystem.
+/// Pure mechanics — every decision (including whether a path even needs
+/// touching) was already made by [`apply_plan::plan`]; this only performs
+/// the rename/remove that `entry.action` names.
+async fn execute_plan(
+    entries: &[apply_plan::PlanEntry],
+    instance_root: &Path,
+    staging_dir: &Path,
+) -> anyhow::Result<()> {
+    use apply_plan::PlanAction;
+    let data_path = instance_root.join("instance");
+    for entry in entries {
+        // `strip_prefix` rather than `[1..]`: char-boundary-safe (an empty
+        // key or one starting with a multibyte character would panic on a
+        // byte-index slice), and it gives `None` instead of a garbage
+        // substring for a key that doesn't actually start with '/'.
+        let rel = entry
+            .path
+            .strip_prefix('/')
+            .ok_or_else(|| anyhow!("packinfo key '{}' must start with '/'", entry.path))?;
+        // Re-checked here rather than trusted from `parse_packinfo`: a `..`
+        // segment survives `Path::join` as a literal component, and
+        // `Path::starts_with` below compares components lexically without
+        // ever resolving `..` — so "mods/../../evil" joined onto the data
+        // dir would otherwise pass the containment check below even though
+        // the real, OS-resolved path escapes the data dir entirely.
+        if packinfo::has_dotdot_segment(&entry.path) {
+            bail!("packinfo key '{}' contains a '..' path segment", entry.path);
+        }
+        let live = instance_root.join("instance").join(rel);
+        let staged = staging_dir.join("instance").join(rel);
+        // Belt-and-braces even though `parse_packinfo` already rejects a
+        // doubled leading '/': `Path::join` with an absolute argument
+        // REPLACES the base entirely, so a key like "//tmp/esc" (whose tail
+        // after stripping one '/' is itself still absolute) would otherwise
+        // point `remove_file`/`rename` below at a path outside the instance
+        // — never trust a join alone before a destructive op.
+        if !live.starts_with(&data_path) {
+            bail!(
+                "packinfo key '{}' escapes the instance data dir",
+                entry.path
+            );
+        }
+        let twin = disabled_sibling(&live);
+        match entry.action {
+            PlanAction::Keep => {}
+            PlanAction::Delete => {
+                tokio::fs::remove_file(&live).await?;
+            }
+            PlanAction::Replace => {
+                let (source, is_disabled) =
+                    resolve_staged(&staged).ok_or_else(|| missing_staged_error(&entry.path))?;
+                if is_disabled {
+                    // The target now ships this path disabled by default:
+                    // land it under the twin spelling, then drop the
+                    // previously-enabled live copy so only one spelling of
+                    // the file survives on disk.
+                    tokio::fs::rename(&source, &twin).await?;
+                    tokio::fs::remove_file(&live).await?;
+                } else {
+                    tokio::fs::rename(&source, &live).await?;
+                }
+            }
+            PlanAction::Create => {
+                let (source, is_disabled) =
+                    resolve_staged(&staged).ok_or_else(|| missing_staged_error(&entry.path))?;
+                // A pack-shipped-disabled path must land disabled, not
+                // enabled — the pack's own default is preserved.
+                let dest = if is_disabled { &twin } else { &live };
+                tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+                tokio::fs::rename(&source, dest).await?;
+            }
+            PlanAction::ReplaceDisabled => {
+                let (source, _) =
+                    resolve_staged(&staged).ok_or_else(|| missing_staged_error(&entry.path))?;
+                tokio::fs::rename(&source, &twin).await?;
+            }
+            PlanAction::ReEnable => {
+                if let Some((source, _)) = resolve_staged(&staged) {
+                    tokio::fs::create_dir_all(live.parent().unwrap()).await?;
+                    tokio::fs::rename(&source, &live).await?;
+                    // Propagated rather than swallowed: repair is retryable,
+                    // so a twin that can't be removed (locked by another
+                    // process, or — in the pathological case — not even a
+                    // regular file) must fail the operation loudly. Silently
+                    // ignoring the error would leave both spellings on disk
+                    // (the newly re-enabled live file and the stale disabled
+                    // twin) with nothing to report it, and the caller would
+                    // go on to promote the apply and write an audit that
+                    // never mentions the leftover twin.
+                    tokio::fs::remove_file(&twin).await?;
+                } else {
+                    tokio::fs::rename(&twin, &live).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deletes every path in a repair's `cleanup_paths` from the live instance
+/// data dir, on the user's own explicit request from the repair preview.
+/// Runs after [`execute_plan`] so a cleanup can never race the pack's own
+/// reconciliation of the same path.
+///
+/// **Never bails.** `repair_modpack` already rejected a syntactically
+/// invalid path before this pipeline ever started (see
+/// [`crate::managers::instance::modpack::normalize_cleanup_path`]'s doc), so
+/// by the time execution reaches here every remaining failure mode — a
+/// tracked path, a symlink-widened escape, a plain I/O error — is either an
+/// adversarial input or a benign race, never a normal user mistake worth
+/// aborting the whole apply for. A single bad entry after [`execute_plan`]
+/// has already run would otherwise skip the audit write and the
+/// `packinfo.json` promotion entirely and leave `.setup/repair` in place, so
+/// every future relaunch re-enters repair and re-fails at the identical
+/// path forever. Every rejection is `tracing::warn!`-logged and the path is
+/// skipped instead: it simply stays on disk, absent from the returned list
+/// (and so absent from the audit's "removed at user request" section too).
+///
+/// **Walk-membership design.** A byte-exact string comparison against
+/// `/saves`, a `.disabled` suffix, or a packinfo key is not enough on its
+/// own: Windows and default-configuration macOS resolve paths
+/// case-insensitively (`/Saves/...` reaches the same file as `/saves/...`,
+/// `/Mods/tracked.jar` the same as `/mods/tracked.jar`), and Windows also
+/// silently drops a trailing dot/space — any of these would pass every
+/// string check here yet still delete the real `/saves` or pack-tracked
+/// file once the OS's own path resolution runs inside `remove_file`. Rather
+/// than chase every OS-specific aliasing rule with case-folds, this closes
+/// the whole class structurally: [`walk_untracked_files`] walks the REAL
+/// instance data dir once and returns the ground-truth set of untracked
+/// files, each keyed by the raw spelling **the walk itself observed** (never
+/// a spelling derived from user input) and mapped to that file's own real
+/// [`PathBuf`]. A `cleanup_paths` entry (already syntax-validated by
+/// [`normalize_cleanup_path`]) is honored only if it is an *exact* member of
+/// that set — **the `remove_file` target is always the walked entry's own
+/// `PathBuf`, never rebuilt from the user's string.** That is what makes
+/// alias divergence structurally impossible: whatever spelling the user
+/// typed, it only ever earns the deletion of a directory entry the walk
+/// itself enumerated and classified untracked — there is no code path left
+/// where a user-supplied string is turned into a deletion target on its
+/// own, so no OS path-resolution quirk can make the two diverge.
+///
+/// The canonicalize-parent containment check below is kept as defense in
+/// depth against a *walked* entry reached through a symlink somewhere in
+/// the instance tree (`NormalizedWalkdir` follows a symlinked subdirectory
+/// during traversal, same as `fs::metadata`) — `remove_file` itself never
+/// follows a symlink in the final path component, so only the parent chain
+/// needs checking. A path already absent from disk, or whose parent
+/// directory no longer exists at all (a benign race between the walk and
+/// this loop), is not a failure: the user's intent — this path gone — is
+/// already satisfied, though still `tracing::warn!`-logged rather than
+/// silently passed over, since by this point the walk itself just proved
+/// the entry existed a moment ago. Returns exactly the paths actually
+/// removed, for [`render_audit`]'s `user_removed`.
+async fn apply_user_cleanup(
+    cleanup_paths: &[String],
+    old_packinfo: Option<&packinfo::PackInfo>,
+    target_packinfo: &packinfo::PackInfo,
+    instance_root: &Path,
+    fs_case_insensitive: bool,
+) -> Vec<String> {
+    if cleanup_paths.is_empty() {
+        // Avoid walking the whole instance tree for nothing — `cleanup_paths`
+        // is whatever the user ticked in the repair preview's untracked-file
+        // list (`RepairModpack/index.tsx` sends `cleanup_paths: [...ticked()]`),
+        // so an empty list just means the user ticked nothing this time, not
+        // that the feature is unwired.
+        return Vec::new();
+    }
+
+    let instance_data = instance_root.join("instance");
+    let canonical_data = match tokio::fs::canonicalize(&instance_data).await {
+        Ok(p) => p,
+        Err(e) => {
+            // The staging apply that runs immediately before this already
+            // requires this directory to exist — this should never happen,
+            // but "never bail" means treating even this as skip-all rather
+            // than propagating an error that would ALSO lose the audit
+            // write and packinfo promotion, the exact failure mode this
+            // function exists to avoid.
+            tracing::warn!(
+                "skipping all repair cleanup: failed to canonicalize instance data dir {instance_data:?}: {e}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let deletable = walk_untracked_files(
+        &instance_data,
+        old_packinfo,
+        target_packinfo,
+        fs_case_insensitive,
+    )
+    .await;
+
+    let mut user_removed = Vec::new();
+    for path in cleanup_paths {
+        let Some(key) = normalize_cleanup_path(path) else {
+            tracing::warn!("skipping repair cleanup of syntactically invalid path {path:?}");
+            continue;
+        };
+
+        let Some(real_path) = deletable.get(&key) else {
+            tracing::warn!(
+                "skipping repair cleanup of {key}: not an exact match for any untracked file \
+                 currently on disk (either it doesn't exist, or only a differently-spelled \
+                 alias of it does)"
+            );
+            continue;
+        };
+
+        let Some(parent) = real_path.parent() else {
+            tracing::warn!("skipping repair cleanup of {key}: path has no parent directory");
+            continue;
+        };
+        let canonical_parent = match tokio::fs::canonicalize(parent).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping repair cleanup of {key}: failed to canonicalize parent directory \
+                     (the walk found it moments ago, so this is likely a race): {e}"
+                );
+                continue;
+            }
+        };
+        if !canonical_parent.starts_with(&canonical_data) {
+            tracing::warn!(
+                "skipping repair cleanup of {key}: resolves outside the instance data dir \
+                 once its parent directory's symlinks are followed"
+            );
+            continue;
+        }
+
+        match tokio::fs::remove_file(real_path).await {
+            Ok(()) => user_removed.push(key),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    "repair cleanup of {key}: the walk found it moments ago but it is gone now \
+                     (likely a race) — treating as already satisfied"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("skipping repair cleanup of {key}: failed to remove: {e}");
+            }
+        }
+    }
+    user_removed
+}
+
+/// Resolves the physical staged file backing a plan entry, which may sit
+/// under its bare name or — when the target ships this path disabled by
+/// default — under the `.disabled`-suffixed name. `packinfo::scan_dir`
+/// strips that suffix when keying `tmp-packinfo.json`
+/// (`packinfo/scan.rs:30-32`), so a [`apply_plan::PlanEntry::path`] never
+/// carries it even when the only staged copy does; this is where that gets
+/// reconciled against what is physically on disk. The bare spelling wins
+/// when (implausibly) both exist. `Some((path, true))` means the resolved
+/// copy is the disabled spelling.
+fn resolve_staged(staged_bare: &Path) -> Option<(PathBuf, bool)> {
+    if staged_bare.is_file() {
+        return Some((staged_bare.to_path_buf(), false));
+    }
+    let twin = disabled_sibling(staged_bare);
+    twin.is_file().then_some((twin, true))
+}
+
+/// The planner already required a staged source to exist (via the same
+/// path-normalised `staged` set) before choosing an action that needs one,
+/// so `resolve_staged` failing here means that invariant broke, not a
+/// normal runtime condition — still handled as a proper error rather than a
+/// panic, since a real filesystem is involved.
+fn missing_staged_error(path: &str) -> anyhow::Error {
+    anyhow!(
+        "planner chose an action requiring a staged source for {path}, but neither the bare nor \
+         .disabled-suffixed staged copy exists on disk"
+    )
+}
+
+/// `<name>` -> `<name>.disabled`, the on-disk convention for a disabled mod.
+fn disabled_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap().to_owned();
+    name.push(".disabled");
+    path.with_file_name(name)
+}
+
+/// Renders the plain-text install audit `apps/desktop/e2e-tests/helpers/installAudit.ts`
+/// parses. Pure and unit-tested (`staging_test::render_audit_golden`) — every
+/// byte of an existing section is a format contract with that parser, so a
+/// change here must stay in lockstep with it. `entries` are expected
+/// path-sorted (guaranteed by [`apply_plan::plan`]'s own output), which is
+/// what makes each section's line order deterministic.
+fn render_audit(entries: &[apply_plan::PlanEntry], user_removed: &[String]) -> String {
+    use apply_plan::{PlanAction, PlanReason};
+    let mut skipped = String::new();
+    let mut deleted = String::new();
+    let mut replaced = String::new();
+    let mut created = String::new();
+    let mut unchanged = String::new();
+    let mut re_enabled = String::new();
+
+    for e in entries {
+        let file = &e.path;
+        match (&e.action, &e.reason) {
+            (PlanAction::Keep, PlanReason::DeletedByUser) => {
+                skipped += &format!(" - {file}: deleted by user\n")
+            }
+            (PlanAction::Keep, PlanReason::ModifiedByUser { original, current })
+            | (PlanAction::Keep, PlanReason::DroppedButModified { original, current }) => {
+                skipped += &format!(
+                    " - {file}: modified by user\n     original md5: {}\n     current md5:  {}\n",
+                    hex::encode(original),
+                    hex::encode(current),
+                )
+            }
+            (PlanAction::Keep, PlanReason::InSaveFolder) => {
+                skipped += &format!(" - {file}: files in /saves will never be modified\n")
+            }
+            (PlanAction::Keep, PlanReason::DisabledByUser) => {
+                skipped += &format!(" - {file}: disabled by user\n")
+            }
+            (PlanAction::Keep, PlanReason::PreservedExisting) => {
+                skipped += &format!(" - {file}: already present\n")
+            }
+            // `surviving_path` is deliberately not interpolated into this
+            // line: `installAudit.ts`'s `skipped` section parses the text
+            // after the last ": " as an exact match against a closed
+            // `REASONS` map, so the reason string has to be fixed, the same
+            // way `ModifiedByUser`'s variable md5s live on separate
+            // continuation lines rather than in the reason text itself.
+            // Belongs in `skipped`, not `unchanged`: `installAudit.ts`
+            // documents `unchanged` as "already matched the target", which a
+            // suppressed Delete did not — the file was never touched, but
+            // its old spelling and the target's spelling genuinely differ.
+            (PlanAction::Keep, PlanReason::CaseAliasedByTarget { .. }) => {
+                skipped += &format!(" - {file}: case-aliased with a tracked path\n")
+            }
+            (PlanAction::Keep, _) => unchanged += &format!(" - {file}\n"),
+            (PlanAction::Delete, _) => deleted += &format!(" - {file}\n"),
+            (PlanAction::Replace, _) | (PlanAction::ReplaceDisabled, _) => {
+                replaced += &format!(" - {file}\n")
+            }
+            (PlanAction::Create, _) => created += &format!(" - {file}\n"),
+            (PlanAction::ReEnable, _) => re_enabled += &format!(" - {file}\n"),
+        }
+    }
+
+    let mut audit = "GDLauncher Modpack Install/Update Audit\n".to_string();
+    audit += "\nFiles that could not be replaced:\n";
+    audit += &skipped;
+    audit += "\nFiles deleted:\n";
+    audit += &deleted;
+    audit += "\nFiles replaced:\n";
+    audit += &replaced;
+    audit += "\nFiles created:\n";
+    audit += &created;
+    audit += "\nFiles unchanged:\n";
+    audit += &unchanged;
+    audit += "\nFiles re-enabled:\n";
+    audit += &re_enabled;
+    audit += "\nFiles removed at user request:\n";
+    for file in user_removed {
+        audit += &format!(" - {file}\n");
+    }
+    audit
+}
+
+#[cfg(test)]
+#[path = "staging_test.rs"]
+mod staging_test;

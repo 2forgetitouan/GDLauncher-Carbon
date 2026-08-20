@@ -1,6 +1,10 @@
 // Intentionally putting this on top to catch any potential error in dependencies as well
 
 declare const __SHOWCASE_MODE__: boolean
+/** True only in builds produced by the `build:*-e2e` scripts — the Electron
+ *  counterpart of the core's `e2e` cargo feature. See this file's use of it
+ *  and `packages/main/vite.config.mjs`. */
+declare const __E2E_BUILD__: boolean
 
 console.log("Initializing application...")
 
@@ -29,6 +33,12 @@ import { spawn } from "child_process"
 import crypto from "crypto"
 import log from "electron-log/main"
 import { hashEmailForOverwolf } from "./utils/emailHash"
+import { buildCoreModuleArgs } from "./utils/coreArgs.js"
+import { assertSafeRuntimeTarget } from "./utils/runtimePathGuard.js"
+import {
+  handleBeforeSendHeaders,
+  handleHeadersReceived
+} from "./utils/headerRewrite.js"
 import * as Sentry from "@sentry/electron/main"
 import "./preloadListeners"
 import getAdSize from "./adSize"
@@ -243,6 +253,20 @@ const allowMultipleInstances = validateArgument(
 )
 
 const overrideBaseApi = validateArgument("--gdl_override_base_api")
+const e2eAuthBase = validateArgument("--gdl_e2e_auth_base")
+const e2eEntitlementKey = validateArgument("--gdl_e2e_entitlement_key")
+// Gated at the build, not merely parsed and ignored. Unlike the two flags
+// above — which are forwarded to the core and are inert unless it was built
+// with the `e2e` cargo feature — this one is consumed by this process and
+// hands electron-updater a new feed URL. In a shipped build that is an
+// update-channel redirect available to anyone who can influence the
+// launcher's command line (an edited shortcut or .desktop file), and on
+// Linux the integrity check is the sha512 from that same feed, so it does
+// not help. `__E2E_BUILD__` is false in every released artifact, and the
+// argument is not even read there.
+const e2eUpdateFeed = __E2E_BUILD__
+  ? validateArgument("--gdl_e2e_update_feed")
+  : null
 
 if (!allowMultipleInstances) {
   if (!app.requestSingleInstanceLock()) {
@@ -290,6 +314,24 @@ export type CoreModule = () => Promise<
         apiToken: string
         kill: () => void
       }
+      // The core's own stdout/stderr up to and including `_STATUS_:READY`.
+      // The listeners that populate this stop appending once `started`
+      // flips true (see `loadCoreModule`), bounding this array from that
+      // point on; every fatal path bounds it too, for a different reason —
+      // the core process itself has exited, so no further `data` events
+      // fire regardless of `started`. Bounded on every path except one: the
+      // hung-startup timeout (`setTimeout` below) resolves with `started`
+      // still false while the core stays alive by design
+      // (`coreProcessHandle`'s own comment), so this buffer keeps growing
+      // there for as long as the core does. The listeners themselves stay
+      // attached in every case to keep handling later events
+      // (`_INSTANCE_STATE_`, account email, ...). `main.tsx` ignores this on
+      // the success path, but it is the only record of a *non-fatal* status
+      // line — `DB_DOWNGRADED` chief among them — that startup otherwise
+      // never surfaces anywhere observable once the app is up. Exposed so
+      // `getCoreModule` can answer "what did the core actually report"
+      // regardless of outcome, not only on failure.
+      logs: Log[]
     }
   | {
       type: "error"
@@ -300,6 +342,7 @@ export type CoreModule = () => Promise<
     }
   | {
       type: "backwardsMigration"
+      logs: Log[]
     }
 >
 
@@ -307,6 +350,41 @@ export type CoreModule = () => Promise<
 // Debug builds of the rust core accept this fixed token; release builds
 // rotate randomly per launch.
 const DEV_API_TOKEN = "dev-mode-only-do-not-use-in-production"
+
+// The spawned core process, tracked at module scope so recovery handlers can
+// terminate it even when it never reached READY: a hung startup resolves the
+// core promise via the timeout below while the process itself stays alive.
+let coreProcessHandle: ChildProcessWithoutNullStreams | null = null
+
+// Terminate the core (if still running) and wait, briefly, for it to exit.
+// Recovery must release the database file before deleting or overwriting it;
+// on Windows the holding process has to have exited first.
+async function killCoreProcess(timeoutMs = 5000): Promise<void> {
+  const proc = coreProcessHandle
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+    return
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      resolve()
+    }
+    proc.once("exit", finish)
+    const timer = setTimeout(finish, timeoutMs)
+    if (typeof timer.unref === "function") {
+      timer.unref()
+    }
+    try {
+      proc.kill()
+    } catch {
+      finish()
+    }
+  })
+}
 
 const loadCoreModule: CoreModule = () =>
   new Promise((resolve, _) => {
@@ -318,7 +396,8 @@ const loadCoreModule: CoreModule = () =>
           port: 4650,
           apiToken: DEV_API_TOKEN,
           kill: () => {}
-        }
+        },
+        logs: []
       })
       console.log("Core module loaded in development mode")
       return
@@ -336,11 +415,12 @@ const loadCoreModule: CoreModule = () =>
     let coreModule: ChildProcessWithoutNullStreams | null = null
     const logs: Log[] = []
 
-    const args = ["--runtime_path", CURRENT_RUNTIME_PATH!]
-
-    if (overrideBaseApi?.value) {
-      args.push("--base_api", overrideBaseApi.value)
-    }
+    const args = buildCoreModuleArgs({
+      runtimePath: CURRENT_RUNTIME_PATH!,
+      baseApi: overrideBaseApi?.value,
+      e2eAuthBase: e2eAuthBase?.value,
+      e2eEntitlementKey: e2eEntitlementKey?.value
+    })
 
     try {
       coreModule = spawn(coreModulePath, args, {
@@ -352,6 +432,17 @@ const loadCoreModule: CoreModule = () =>
           RUST_BACKTRACE: "full"
         }
       })
+      coreProcessHandle = coreModule
+      // Exposed for the e2e harness (`e2e-tests/fixtures/electronApp.ts`'s
+      // `relaunchApp`), which runs in a separate OS process from this one and
+      // has no other way to read this process's own module-scope state. It
+      // reads this via Playwright's `ElectronApplication.evaluate`, which
+      // executes directly in this main process, to confirm the core process
+      // it just closed has genuinely exited before relaunching onto the same
+      // database — see that file for why a fixed sleep isn't good enough
+      // here. Harmless outside a test: just an OS pid number on `globalThis`.
+      ;(globalThis as Record<string, unknown>).__gdlCoreProcessId =
+        coreModule.pid ?? null
       console.log("Core module spawned successfully")
     } catch (err: unknown) {
       console.error(`[CORE] Spawn error: ${String(err)}`)
@@ -406,10 +497,23 @@ const loadCoreModule: CoreModule = () =>
 
       const rows = dataString.split(/\r?\n|\r|\n/g)
 
-      logs.push({
-        type: "info",
-        message: sanitized
-      })
+      // Bounds `logs` to output observed no later than `_STATUS_:READY` on
+      // the success path, or no later than the core's own exit on every
+      // fatal path (see the `CoreModule` type's own comment on `logs` for
+      // why those are the only two cases this bounds — the hung-startup
+      // timeout does not). This buffer is exposed over IPC via
+      // `getCoreModule`, unconditionally, on every call, so once one of
+      // those two things has happened it must not keep accumulating for the
+      // rest of the process's life. The dispatch loop below still runs
+      // unconditionally after this, since `_INSTANCE_STATE_`/account-email/
+      // close-warning handling must keep working for as long as the core
+      // runs.
+      if (!started) {
+        logs.push({
+          type: "info",
+          message: sanitized
+        })
+      }
 
       for (const row of rows) {
         if (row.startsWith("_STATUS_:")) {
@@ -445,12 +549,14 @@ const loadCoreModule: CoreModule = () =>
                 port,
                 apiToken,
                 kill: () => coreModule?.kill()
-              }
+              },
+              logs
             })
           } else if (event === "BACKWARDS_MIGRATION") {
             console.log("[CORE] Backwards migration detected")
             resolve({
-              type: "backwardsMigration"
+              type: "backwardsMigration",
+              logs
             })
           } else if (event === "DB_DOWNGRADED") {
             // A newer database was stepped back to this build's version and
@@ -462,7 +568,7 @@ const loadCoreModule: CoreModule = () =>
             event === "DB_CORRUPT" ||
             event === "DB_DOWNGRADE_FAILED"
           ) {
-            // Fatal database outcomes (spec §13). The core emits exactly one of
+            // Fatal database outcomes. The core emits exactly one of
             // these then exits; surface the failure screen with the recovery
             // ladder. `DB_DOWNGRADE_FAILED` carries a pre-downgrade snapshot
             // path, which unlocks the "Restore snapshot" step.
@@ -593,15 +699,32 @@ const loadCoreModule: CoreModule = () =>
     })
 
     coreModule.stderr.on("data", (data) => {
-      logs.push({
-        type: "error",
-        message: data.toString()
-      })
+      // Same READY boundary as the stdout listener above, but unlike it,
+      // nothing here is redacted before being pushed to `logs` (exposed over
+      // IPC on every outcome, including success — see the `CoreModule` type
+      // comment). This is deliberately not the same risk as the stdout
+      // listener's redaction: `tracing` writes to the release build's file
+      // appender, never to stderr (`logger.rs`'s `setup_logger`), so nothing
+      // this process prints to its own stdout ever reaches this listener by
+      // construction. What can land here pre-READY is Rust's own panic
+      // output (a `RUST_BACKTRACE=full` backtrace, since `loadCoreModule`
+      // sets that env var) and `logger.rs`'s `cleanup_old_logs`, which
+      // `eprintln!`s directly on a failed old-log deletion — neither carries
+      // anything more sensitive than a local file path or Rust source
+      // location, nothing user-identifying, so no redaction is needed here
+      // the way the READY token and account email are on the stdout side.
+      if (!started) {
+        logs.push({
+          type: "error",
+          message: data.toString()
+        })
+      }
       console.error(`[CORE] Error: ${data.toString()}`)
     })
 
     coreModule.on("exit", (code) => {
       console.log(`[CORE] Exit with code: ${code}`)
+      coreProcessHandle = null
 
       // If we get here without `started` being true, the core module exited
       // before emitting `_STATUS_:READY`. That's always an error condition,
@@ -896,36 +1019,6 @@ async function createWindow(): Promise<BrowserWindow> {
       }, 500)
     }
 
-    function upsertKeyValue(obj: any, keyToChange: string, value: any) {
-      const keyToChangeLower = keyToChange.toLowerCase()
-      for (const key of Object.keys(obj)) {
-        if (key.toLowerCase() === keyToChangeLower) {
-          return
-        }
-      }
-      // Insert at end instead
-      obj[keyToChange] = value
-    }
-
-    win?.webContents.session.webRequest.onBeforeSendHeaders(
-      (details, callback) => {
-        const { requestHeaders } = details
-        upsertKeyValue(requestHeaders, "Access-Control-Allow-Origin", ["*"])
-        callback({ requestHeaders })
-      }
-    )
-
-    win?.webContents.session.webRequest.onHeadersReceived(
-      (details, callback) => {
-        const { responseHeaders } = details
-        upsertKeyValue(responseHeaders, "Access-Control-Allow-Origin", ["*"])
-        upsertKeyValue(responseHeaders, "Access-Control-Allow-Headers", ["*"])
-        callback({
-          responseHeaders
-        })
-      }
-    )
-
     if (import.meta.env.DEV && !__SHOWCASE_MODE__) {
       win?.webContents.openDevTools()
     }
@@ -944,14 +1037,7 @@ async function createWindow(): Promise<BrowserWindow> {
 ipcMain.handle("relaunch", async () => {
   console.log("relaunching app...")
 
-  try {
-    const _coreModule = await coreModule
-    if (_coreModule.type === "success") {
-      _coreModule.result.kill()
-    }
-  } catch {
-    // No op
-  }
+  await killCoreProcess()
 
   app.relaunch()
   app.exit()
@@ -961,15 +1047,10 @@ ipcMain.handle("deleteDbAndRestart", async () => {
   console.log("deleting database and restarting app...")
 
   // Kill the core FIRST: on Windows, unlinking a file the core still holds
-  // open fails, so the process must exit before we delete the database.
-  try {
-    const _coreModule = await coreModule
-    if (_coreModule.type === "success") {
-      _coreModule.result.kill()
-    }
-  } catch {
-    // No op
-  }
+  // open fails, so the process must exit before we delete the database. This
+  // also covers a startup that hung before READY, where the process is still
+  // alive.
+  await killCoreProcess()
 
   const dbPath = path.join(CURRENT_RUNTIME_PATH!, "gdl_conf.db")
 
@@ -1001,23 +1082,45 @@ ipcMain.handle(
     console.log(`restoring database from snapshot ${snapshotPath}...`)
 
     // Kill the core FIRST so the database file is not held open while we
-    // overwrite it (same Windows open-file constraint as the reset path).
-    try {
-      const _coreModule = await coreModule
-      if (_coreModule.type === "success") {
-        _coreModule.result.kill()
-      }
-    } catch {
-      // No op
-    }
+    // overwrite it (same Windows open-file constraint as the reset path). This
+    // also covers a startup that hung before READY.
+    await killCoreProcess()
 
     const dbPath = path.join(CURRENT_RUNTIME_PATH!, "gdl_conf.db")
 
+    // Only the core-emitted pre-downgrade snapshot beside the database may be
+    // restored. Reject any other path so a compromised renderer cannot copy an
+    // arbitrary file over the database.
+    const expectedSnapshot = path.join(
+      CURRENT_RUNTIME_PATH!,
+      "gdl_conf.pre-downgrade.db"
+    )
+    if (path.resolve(snapshotPath) !== path.resolve(expectedSnapshot)) {
+      console.error(
+        `refusing to restore from unexpected snapshot path: ${snapshotPath}`
+      )
+      return
+    }
+
+    const tmpPath = `${dbPath}.restore-tmp`
     try {
-      await fs.copyFile(snapshotPath, dbPath)
+      // Copy to a sibling temp file, then atomically rename it over the
+      // database. A crash or error mid-copy then leaves the original database
+      // intact rather than a half-written one whose sidecars we're about to
+      // drop below.
+      await fs.copyFile(snapshotPath, tmpPath)
+      await fs.rename(tmpPath, dbPath)
       console.log("snapshot restored over gdl_conf.db")
     } catch (e) {
       console.error("failed to restore snapshot:", e)
+      try {
+        await fs.unlink(tmpPath)
+      } catch {
+        // best effort — the temp file may not have been created
+      }
+      // Leave the existing database and its sidecars untouched rather than
+      // relaunching onto a half-restored file.
+      return
     }
 
     // Drop the WAL/SHM sidecars so the restored file is opened as-is rather
@@ -1137,6 +1240,9 @@ ipcMain.handle(
       return
     }
 
+    // Reject dangerous targets before creating/copying/deleting anything.
+    assertSafeRuntimeTarget(newPath, CURRENT_RUNTIME_PATH)
+
     const runtimeOverridePath = path.join(
       app.getPath("userData"),
       RUNTIME_PATH_OVERRIDE_NAME
@@ -1163,17 +1269,12 @@ ipcMain.handle(
       }
     }
 
-    try {
-      const cm = await coreModule
-      if (cm.type === "success") {
-        console.log(`[RTP] Killing core module`)
-        cm.result.kill()
-        // Give the OS a moment to release file handles (SQLite WAL, logs)
-        await new Promise((r) => setTimeout(r, 1500))
-      }
-    } catch {
-      // No op
-    }
+    // Kill the core FIRST so the database file (SQLite WAL, logs) is not held
+    // open while its directory is copied to the new location — same Windows
+    // open-file constraint as the reset/restore paths above. This also covers
+    // a startup that hung before READY.
+    console.log(`[RTP] Killing core module`)
+    await killCoreProcess()
 
     // Switch-only path: the target dir already contains the user's data and
     // they want to use it as-is. Don't touch any files in either dir; just
@@ -1349,7 +1450,10 @@ ipcMain.handle("getCoreModule", async () => {
 
   return {
     type: cm.type,
-    logs: cm.type === "error" ? cm.logs : undefined,
+    // Present for every outcome, not only `"error"`: the only record of a
+    // non-fatal status line (`DB_DOWNGRADED` chief among them) once startup
+    // has moved on, since nothing else threads it anywhere observable.
+    logs: cm.logs,
     snapshotPath: cm.type === "error" ? cm.snapshotPath : undefined,
     port: cm.type === "success" ? cm.result.port : undefined,
     apiToken: cm.type === "success" ? cm.result.apiToken : undefined
@@ -1377,65 +1481,15 @@ app.whenReady().then(async () => {
     applyPendingEmail()
   }
 
+  // Electron allows exactly one listener per webRequest event per session —
+  // a later registration silently replaces an earlier one — so all header
+  // rewriting for the renderer session lives in this single pair. See
+  // ./utils/headerRewrite.ts for what each listener does and why both guard
+  // against missing headers and always invoke `callback` exactly once.
   session.defaultSession.webRequest.onBeforeSendHeaders(
-    {
-      urls: ["http://*/*", "https://*/*"]
-    },
-    (details, callback) => {
-      details.requestHeaders.Origin = "https://app.gdlauncher.com"
-      callback({ requestHeaders: details.requestHeaders })
-    }
+    handleBeforeSendHeaders
   )
-
-  session.defaultSession.webRequest.onHeadersReceived(
-    {
-      urls: ["http://*/*", "https://*/*"]
-    },
-    (details, callback) => {
-      delete details.responseHeaders!["Access-Control-Allow-Origin"]
-
-      delete details.responseHeaders!["access-control-allow-origin"]
-      details.responseHeaders!["Access-Control-Allow-Origin"] = ["*"]
-
-      // Remove X-Frame-Options and CSP frame-ancestors for iframe-embeddable content
-      // This allows YouTube and other embeds to work when loaded from file:// origin
-      const url = details.url.toLowerCase()
-      const isEmbeddableContent =
-        url.includes("youtube.com") ||
-        url.includes("youtube-nocookie.com") ||
-        url.includes("googlevideo.com") || // YouTube video CDN
-        url.includes("i.imgur.com") ||
-        url.includes("cdn.ko-fi.com")
-
-      if (isEmbeddableContent) {
-        // Remove X-Frame-Options header (case-insensitive)
-        delete details.responseHeaders!["X-Frame-Options"]
-        delete details.responseHeaders!["x-frame-options"]
-
-        // Remove or modify Content-Security-Policy frame-ancestors
-        // Note: CSP can have multiple header names
-        const cspKeys = Object.keys(details.responseHeaders!).filter(
-          (key) =>
-            key.toLowerCase() === "content-security-policy" ||
-            key.toLowerCase() === "content-security-policy-report-only"
-        )
-        for (const key of cspKeys) {
-          const values = details.responseHeaders![key]
-          if (values) {
-            // Remove frame-ancestors directive from CSP
-            details.responseHeaders![key] = values.map((value) =>
-              value.replace(/frame-ancestors\s+[^;]+;?/gi, "")
-            )
-          }
-        }
-      }
-
-      callback({
-        cancel: false,
-        responseHeaders: details.responseHeaders
-      })
-    }
-  )
+  session.defaultSession.webRequest.onHeadersReceived(handleHeadersReceived)
 
   app.on("second-instance", (_e, argv) => {
     // Handle protocol URLs on Windows (passed as command line arguments)
@@ -1498,7 +1552,7 @@ app.whenReady().then(async () => {
     }
   )
 
-  initAutoUpdater()
+  initAutoUpdater(e2eUpdateFeed?.value)
 })
 
 app.on("window-all-closed", async () => {

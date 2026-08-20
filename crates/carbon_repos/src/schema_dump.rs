@@ -4,7 +4,7 @@
 //! whitespace-normalized text form so the same logical schema produces
 //! byte-identical output across SQLite builds that reformat stored DDL text
 //! differently. This is the acceptance test for the rusqlite/bundled-SQLite
-//! version bump (Task 4): the schema snapshot test in `tests/` byte-compares
+//! version bump: the schema snapshot test in `tests/` byte-compares
 //! this dump against a committed baseline before and after the bump. Plan 4's
 //! runtime verification reuses this same function against the same baseline.
 
@@ -91,10 +91,21 @@ pub fn normalize_ddl(sql: &str) -> String {
 /// the legacy `_prisma_migrations` shim) are excluded: they carry runner state,
 /// not the logical schema, so schema comparisons — the committed snapshot and
 /// the down-run verification in [`crate::compat`] alike — must not see them.
+///
+/// SQLite's statistics tables (`sqlite_stat1` and friends) are excluded for the
+/// same reason, and because including them makes a comparison unsatisfiable:
+/// `ANALYZE` or `PRAGMA optimize` — which external tools run against the file —
+/// creates them on the live database, while the reference schema is a pristine
+/// replay that never has them. Other engine-owned objects stay in: an
+/// `sqlite_autoindex_*` is created automatically on both sides by the same
+/// `CREATE TABLE`, so it compares equal and is part of the committed baseline.
 pub fn dump_schema(conn: &Connection) -> DbResult<String> {
     let mut stmt = conn.prepare(
         "SELECT type, name, tbl_name, sql FROM sqlite_master
-         WHERE tbl_name NOT IN ('_migrations', '_prisma_migrations')
+         WHERE tbl_name NOT IN (
+             '_migrations', '_prisma_migrations',
+             'sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4'
+         )
          ORDER BY type, name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -128,7 +139,7 @@ pub fn dump_schema(conn: &Connection) -> DbResult<String> {
 /// created automatically the first time an `AUTOINCREMENT` table is created —
 /// re-issuing its `CREATE TABLE` is a reserved-name error).
 ///
-/// This is the fresh-install baseline's execution order (spec §11): the exact
+/// This is the fresh-install baseline's execution order: the exact
 /// dump the schema snapshot test byte-compares as text is, here, replayed as
 /// DDL by [`crate::compat`] instead of the historical migration chain.
 pub fn executable_statements(dump: &str) -> Vec<String> {
@@ -172,6 +183,47 @@ mod tests {
         let (m, _n) = crate::get_migrations();
         m.to_latest(&mut conn).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn analyze_does_not_change_the_dump() {
+        // An external tool running ANALYZE (or PRAGMA optimize) against the
+        // file creates sqlite_stat tables on the live database. The reference
+        // schema a down-run verifies against is a pristine replay that never
+        // has them, so counting them would make that comparison impossible to
+        // satisfy: every downgrade would fail, and because the rollback leaves
+        // the database byte-identical to its snapshot, no restore is offered
+        // and the recovery ladder steers the user to Reset Database.
+        let (_d, conn) = migrated();
+        let before = dump_schema(&conn).unwrap();
+
+        conn.execute_batch("ANALYZE").unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'")
+                .unwrap()
+                .exists([])
+                .unwrap(),
+            "ANALYZE should have created sqlite_stat1, otherwise this proves nothing"
+        );
+
+        assert_eq!(
+            dump_schema(&conn).unwrap(),
+            before,
+            "statistics tables must not appear in the schema dump"
+        );
+    }
+
+    #[test]
+    fn auto_indexes_are_still_part_of_the_dump() {
+        // Only the statistics tables are engine state; an sqlite_autoindex_* is
+        // created by the same CREATE TABLE on both sides of any comparison and
+        // belongs in the committed baseline.
+        let (_d, conn) = migrated();
+        let dump = dump_schema(&conn).unwrap();
+        assert!(
+            dump.contains("sqlite_autoindex_"),
+            "auto-indexes must survive the exclusion:\n{dump}"
+        );
     }
 
     #[test]
@@ -290,7 +342,7 @@ mod tests {
         // The dump of the fully migrated chain, replayed through
         // `executable_statements`, must reproduce the exact same schema when
         // executed fresh — the property the fresh-install baseline path relies
-        // on (spec §11).
+        // on.
         let (_d, conn) = migrated();
         let dump = dump_schema(&conn).unwrap();
 
