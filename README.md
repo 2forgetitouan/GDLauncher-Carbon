@@ -1,4 +1,4 @@
-# GDLauncher (Carbon)
+# GDLauncher (Carbon) Cracked
 
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](http://makeapullrequest.com)
 ![Discord](https://img.shields.io/discord/398091532881756161)
