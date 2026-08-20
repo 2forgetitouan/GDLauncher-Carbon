@@ -36,6 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/offline-support' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Prepare
         run: |
@@ -134,6 +135,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/offline-support' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Install mold linker
         run: sudo apt-get install -y mold
@@ -244,6 +246,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "GDL -> GDL/target"
+          save-if: ${{ github.ref == 'refs/heads/offline-support' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Install scoop and llvm
         run: |
